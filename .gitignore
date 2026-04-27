@@ -1,0 +1,14 @@
+# ESPHome secrets (contains WiFi credentials)
+secrets.yaml
+
+# Python virtual environment
+venv/
+
+# ESPHome build output
+.esphome/
+
+# PlatformIO build artifacts
+.pioenvs/
+.piolibdeps/
+
+.DS_Store
