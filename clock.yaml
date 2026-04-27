@@ -103,12 +103,45 @@ binary_sensor:
     name: "User Button"
     id: user_button
 
-# BH1750 ambient light sensor on I2C
+# BH1750 ambient light sensor on I2C.
+# When "Auto Brightness" is enabled, on_value drives the clock's brightness
+# from a log-lux curve (see lambda below), scaled by "Brightness Bias" and
+# clamped to a safe range. A short median filter rejects single-sample spikes
+# (passing shadows, brief reflections) without slowing the response.
 sensor:
   - platform: bh1750
     name: "Ambient Light"
+    id: ambient_light
     address: 0x23
-    update_interval: 5s
+    update_interval: 2s
+    filters:
+      - median:
+          window_size: 3
+          send_every: 1
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(auto_brightness);'
+            then:
+              - lambda: |-
+                  // Log-lux to brightness, sized for the deployed PSU (USB-only
+                  // brownouts are only a programming-time concern):
+                  //   1 lux -> 5%, 10 lux -> 29%, 100 lux -> 53%,
+                  //   1000 lux -> 77%, 10000+ lux -> 100%. Linear in log10(lux).
+                  float lux = x > 0.5f ? x : 0.5f;
+                  float log_lux = log10f(lux);
+                  float target = 0.05f + log_lux * 0.24f;
+                  if (target < 0.05f) target = 0.05f;
+                  if (target > 1.00f) target = 1.00f;
+                  target *= id(brightness_bias);
+                  // Hard safety clamp regardless of bias setting.
+                  if (target < 0.02f) target = 0.02f;
+                  if (target > 1.00f) target = 1.00f;
+                  auto call = id(clock_leds).turn_on();
+                  call.set_brightness(target);
+                  call.set_transition_length(2000);
+                  call.perform();
 
 # Get time from Home Assistant or SNTP
 time:
@@ -133,6 +166,20 @@ globals:
     type: int
     restore_value: false
     initial_value: '0'
+  # Auto-brightness: when true, the BH1750 sensor's on_value drives the light's
+  # brightness from a log-lux curve, scaled by brightness_bias.
+  - id: auto_brightness
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  # Multiplier applied to the auto-computed brightness so users can compensate
+  # for sensor placement: <1 dims the response (good for sensors near a lamp),
+  # >1 boosts it (good for shaded corners). Mirrors the Brightness Bias number
+  # entity below, which is the source of truth (restore_value: true).
+  - id: brightness_bias
+    type: float
+    restore_value: false
+    initial_value: '1.0'
 
 switch:
   - platform: template
@@ -147,6 +194,45 @@ switch:
       - globals.set:
           id: rotate_180
           value: 'false'
+  - platform: template
+    name: "Auto Brightness"
+    id: auto_brightness_switch
+    lambda: 'return id(auto_brightness);'
+    turn_on_action:
+      - globals.set:
+          id: auto_brightness
+          value: 'true'
+      # Apply immediately using the latest sensor value rather than waiting
+      # for the next BH1750 update.
+      - component.update: ambient_light
+    turn_off_action:
+      - globals.set:
+          id: auto_brightness
+          value: 'false'
+
+number:
+  - platform: template
+    name: "Brightness Bias"
+    id: brightness_bias_number
+    optimistic: true
+    restore_value: true
+    initial_value: 1.0
+    min_value: 0.5
+    max_value: 2.0
+    step: 0.05
+    mode: slider
+    on_value:
+      then:
+        - globals.set:
+            id: brightness_bias
+            value: !lambda 'return x;'
+        # Re-apply auto brightness so the slider's effect is visible right
+        # away (otherwise it waits for the next BH1750 reading).
+        - if:
+            condition:
+              lambda: 'return id(auto_brightness);'
+            then:
+              - component.update: ambient_light
 
 select:
   - platform: template
