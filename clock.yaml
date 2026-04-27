@@ -1,17 +1,52 @@
-substitutions:
-  # tz database name; change for your location.
-  # Examples: Europe/Berlin, Europe/London, America/Los_Angeles, Asia/Tokyo
-  timezone: "Europe/Berlin"
+# ----------------------------------------------------------------------------
+# Bottle Cap Clock - ESPHome configuration
+#
+# A 4-digit + colon clock built from 65 bottle-cap "pixels" wired as one
+# WS2812 strip (3 LEDs per cap, 195 LEDs total) on a custom ESP32-S3 board.
+#
+# Hardware pinout (override with substitutions below if your wiring differs):
+#   GPIO2   Heartbeat LED
+#   GPIO6   User button (active low, internal pull-up)
+#   GPIO8   I2C SDA (BH1750 ambient light sensor)
+#   GPIO9   I2C SCL
+#   GPIO16  Addressable LED data line (WS2812, 195 LEDs)
+#
+# This file follows the ESPHome "Made for ESPHome" / sharing guidelines so a
+# kit owner can flash it from the dashboard and provision Wi-Fi without
+# editing YAML. See README.md for the end-user setup flow.
+# ----------------------------------------------------------------------------
 
-api:
+substitutions:
+  name: "bottle-cap-clock"
+  friendly_name: "Bottle Cap Clock"
+  # Project version - bump on every release so OTA updates show up correctly
+  # in the ESPHome dashboard / Home Assistant.
+  project_version: "1.0.0"
+  # IANA tz database name. See:
+  # https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+  timezone: "Europe/Berlin"
+  # Hardware pins. Override here if you re-wire the board.
+  led_pin: GPIO16
+  heartbeat_pin: GPIO2
+  button_pin: GPIO6
+  i2c_sda_pin: GPIO8
+  i2c_scl_pin: GPIO9
 
 esphome:
-  name: bottle-cap-clock
-  friendly_name: Bottle Cap Clock
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+  # Append the chip MAC to the hostname so multiple kits coexist on a network
+  # without renaming each one.
+  name_add_mac_suffix: true
+  # Project metadata. Required for ESPHome dashboard adoption.
+  project:
+    name: "bottlecapclock.esphome"
+    version: "${project_version}"
   on_boot:
     priority: -100
     then:
-      # Blink heartbeat LED on boot to confirm working
+      # Quick double blink of the heartbeat LED so you can see the firmware
+      # actually started, even before Wi-Fi / network come up.
       - output.turn_on: heartbeat_led
       - delay: 200ms
       - output.turn_off: heartbeat_led
@@ -19,26 +54,13 @@ esphome:
       - output.turn_on: heartbeat_led
       - delay: 200ms
       - output.turn_off: heartbeat_led
-      # Activate the clock effect on boot. Color and brightness come from the
-      # light's restored state (see restore_mode on clock_leds), so whatever
-      # the user last chose in the web UI / Home Assistant persists across
-      # reboots. Only the effect is forced, so a previous "Cap Walk" or
-      # "Digit Test" session doesn't stick.
+      # Force the clock effect on boot so the strip doesn't get stuck on a
+      # diagnostic effect (Cap Walk / Digit Test) from a previous session.
+      # Color and brightness come from the light's restored state.
       - light.turn_on:
           id: clock_leds
           effect: "Clock Display"
 
-# Custom ESP32-S3 board (16MB flash, 2MB PSRAM)
-# Pinout:
-#   IO2  - Heartbeat LED
-#   IO6  - User Button
-#   IO8  - I2C SDA
-#   IO9  - I2C SCL
-#   IO11 - Addressable LEDs (clock segments)
-#   IO16 - Addressable LEDs (alternate)
-#   IO12,13,21 - Rotary encoder (optional)
-#   IO17,18 - UART1
-#   IO35-37 - SPI
 esp32:
   board: esp32-s3-devkitc-1
   variant: esp32s3
@@ -46,146 +68,194 @@ esp32:
   framework:
     type: arduino
 
+# PSRAM is enabled for general use; the LED strip framebuffer is intentionally
+# kept in SRAM (use_psram: false on the light) for deterministic DMA timing.
 psram:
   mode: octal
   speed: 80MHz
 
-# Enable logging
 logger:
 
-# Enable OTA updates
+# Native API for Home Assistant.
+api:
+
+# Over-the-air updates after the first USB flash.
 ota:
-  platform: esphome
+  - platform: esphome
+    id: ota_esphome
 
-# WiFi configuration
+# Wi-Fi provisioning: device starts in AP mode if no credentials are saved.
+# Connect a phone to the AP, the captive portal opens, and you enter your
+# real Wi-Fi credentials. Improv (serial + BLE) provides the same flow from
+# the ESPHome web tools or any Improv-compatible app.
+#
+# For local development you can hardcode credentials by replacing the AP
+# block with:
+#
+#     ssid: !secret wifi_ssid
+#     password: !secret wifi_password
+#     ap:
+#       ssid: "${friendly_name}"
+#
+# and creating secrets.yaml from secrets.yaml.example.
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
-    ssid: "Bottle-Cap-Clock"
-    password: "configme"
+    ssid: "${friendly_name}"
 
 captive_portal:
 
-# Web server for testing and control
+improv_serial:
+
+esp32_improv:
+  authorizer: none
+
+# Dashboard adoption. Point package_import_url at the public raw URL of this
+# file in your fork so users can adopt the device with one click from the
+# ESPHome dashboard. Leave as-is for the upstream repo.
+dashboard_import:
+  package_import_url: github://bottlecapclock/bottle-cap-clock-esphome/clock.yaml@main
+  import_full_config: false
+
+# Web UI on http://<device-ip>/ for direct control without Home Assistant.
 web_server:
   port: 80
 
-# I2C bus (for BH1750 light sensor)
 i2c:
-  sda: GPIO8
-  scl: GPIO9
+  id: bus_a
+  sda: ${i2c_sda_pin}
+  scl: ${i2c_scl_pin}
   scan: true
 
-# Heartbeat LED on IO2
-output:
-  - platform: gpio
-    pin: GPIO2
-    id: heartbeat_led
-
-# Heartbeat blink interval
-interval:
-  - interval: 1s
-    then:
-      - output.turn_on: heartbeat_led
-      - delay: 20ms
-      - output.turn_off: heartbeat_led
-
-# User button on IO6
-binary_sensor:
-  - platform: gpio
-    pin:
-      number: GPIO6
-      mode: INPUT_PULLUP
-      inverted: true
-    name: "User Button"
-    id: user_button
-
-# BH1750 ambient light sensor on I2C.
-# When "Auto Brightness" is enabled, on_value drives the clock's brightness
-# from a log-lux curve (see lambda below), scaled by "Brightness Bias" and
-# clamped to a safe range. A short median filter rejects single-sample spikes
-# (passing shadows, brief reflections) without slowing the response.
-sensor:
-  - platform: bh1750
-    name: "Ambient Light"
-    id: ambient_light
-    address: 0x23
-    update_interval: 2s
-    filters:
-      - median:
-          window_size: 3
-          send_every: 1
-    on_value:
-      then:
-        - if:
-            condition:
-              lambda: 'return id(auto_brightness);'
-            then:
-              - lambda: |-
-                  // Log-lux to brightness, sized for the deployed PSU (USB-only
-                  // brownouts are only a programming-time concern):
-                  //   1 lux -> 5%, 10 lux -> 29%, 100 lux -> 53%,
-                  //   1000 lux -> 77%, 10000+ lux -> 100%. Linear in log10(lux).
-                  float lux = x > 0.5f ? x : 0.5f;
-                  float log_lux = log10f(lux);
-                  float target = 0.05f + log_lux * 0.24f;
-                  if (target < 0.05f) target = 0.05f;
-                  if (target > 1.00f) target = 1.00f;
-                  target *= id(brightness_bias);
-                  // Hard safety clamp regardless of bias setting.
-                  if (target < 0.02f) target = 0.02f;
-                  if (target > 1.00f) target = 1.00f;
-                  auto call = id(clock_leds).turn_on();
-                  call.set_brightness(target);
-                  call.set_transition_length(2000);
-                  call.perform();
-
-# Get time from Home Assistant or SNTP
 time:
   - platform: sntp
     id: sntp_time
     timezone: ${timezone}
 
-# Persistent flag: when true, the digit grid is rotated 180 degrees so the
-# clock reads correctly when the unit is mounted upside-down. The global is
-# the source of truth (restored across reboots); the template switch below
-# exposes it to the web UI / Home Assistant.
+# Heartbeat LED + 1 Hz blink so the user can tell the device is alive even
+# when the clock display is intentionally dim or off.
+output:
+  - platform: gpio
+    id: heartbeat_led
+    pin: ${heartbeat_pin}
+
+interval:
+  - id: heartbeat_interval
+    interval: 1s
+    then:
+      - output.turn_on: heartbeat_led
+      - delay: 20ms
+      - output.turn_off: heartbeat_led
+
+binary_sensor:
+  - platform: gpio
+    name: "User Button"
+    id: user_button
+    pin:
+      number: ${button_pin}
+      mode: INPUT_PULLUP
+      inverted: true
+
+# BH1750 ambient light sensor. When "Auto Brightness" is on, on_value drives
+# the clock brightness from a log-lux curve scaled by "Brightness Bias". A
+# 3-sample median filter rejects single-sample spikes (passing shadows, brief
+# reflections) without slowing the response.
+sensor:
+  - platform: bh1750
+    name: "Ambient Light"
+    id: ambient_light
+    address: 0x23
+    # Sample every 10 s, smooth across the last minute, and only publish a
+    # new value every 30 s. Keeps auto-brightness reactions gentle and stops
+    # the Ambient Light entity / Home Assistant history from churning on
+    # every tiny lux fluctuation.
+    update_interval: 10s
+    filters:
+      - median:
+          window_size: 6
+          send_every: 6
+          send_first_at: 1
+      - throttle: 30s
+    # Pre-filter: cache the latest lux and apply auto-brightness on every
+    # raw sample so reactions don't wait on the throttle/median used for
+    # the published Ambient Light entity.
+    on_raw_value:
+      then:
+        - lambda: 'id(last_lux) = x;'
+        - script.execute: apply_auto_brightness
+
+# Recomputes clock brightness from the cached last_lux + brightness_bias.
+# Called whenever a fresh lux sample arrives, when the bias slider moves,
+# or when auto-brightness is toggled on.
+script:
+  - id: apply_auto_brightness
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(auto_brightness);'
+          then:
+            - lambda: |-
+                // Log-lux to brightness, sized for the deployed PSU
+                // (USB-only brownouts are a programming-time concern):
+                //   1 lux -> 5%, 10 -> 29%, 100 -> 53%,
+                //   1000 -> 77%, 10000+ -> 100%. Linear in log10(lux).
+                float lux = id(last_lux);
+                if (lux < 0.5f) lux = 0.5f;
+                float log_lux = log10f(lux);
+                float target = 0.05f + log_lux * 0.24f;
+                if (target < 0.05f) target = 0.05f;
+                if (target > 1.00f) target = 1.00f;
+                target *= id(brightness_bias);
+                if (target < 0.02f) target = 0.02f;
+                if (target > 1.00f) target = 1.00f;
+                auto call = id(clock_leds).turn_on();
+                call.set_brightness(target);
+                call.set_transition_length(2000);
+                call.perform();
+
+# Persistent runtime state. The select / switch / number entities below are
+# the user-facing controls; these globals hold the cached values used by the
+# per-frame display lambda.
 globals:
+  # These mirror the matching switch / select entities so the per-frame
+  # display lambda can branch without going through the entity layer. The
+  # entities own persistence (restore_mode / restore_value); the globals
+  # are re-synced from them on boot via turn_on/turn_off_action.
   - id: rotate_180
     type: bool
-    restore_value: true
+    restore_value: false
     initial_value: 'false'
-  # Clock display mode. 0=Mono, 1=Rainbow, 2=Bicolor, 3=Waves. Updated by the
-  # "Clock Mode" select below; cached as an int so the per-frame lambda can
-  # branch without string compares. Persistence is handled by the select
-  # itself (restore_value: true), which calls back into this global on boot.
   - id: clock_mode
     type: int
     restore_value: false
     initial_value: '0'
-  # Auto-brightness: when true, the BH1750 sensor's on_value drives the light's
-  # brightness from a log-lux curve, scaled by brightness_bias.
   - id: auto_brightness
     type: bool
-    restore_value: true
+    restore_value: false
     initial_value: 'false'
-  # Multiplier applied to the auto-computed brightness so users can compensate
-  # for sensor placement: <1 dims the response (good for sensors near a lamp),
-  # >1 boosts it (good for shaded corners). Mirrors the Brightness Bias number
-  # entity below, which is the source of truth (restore_value: true).
   - id: brightness_bias
     type: float
     restore_value: false
     initial_value: '1.0'
+  # Most recent raw lux from the BH1750. Updated on every sample (pre-filter)
+  # so auto-brightness and the bias slider can react immediately without
+  # waiting for the throttled, smoothed published value.
+  - id: last_lux
+    type: float
+    restore_value: false
+    initial_value: '50.0'
 
 switch:
   - platform: template
     name: "Rotate 180"
     id: rotate_180_switch
-    lambda: 'return id(rotate_180);'
+    icon: "mdi:rotate-3d-variant"
+    # The switch itself persists across reboots/reflashes (entity-id-keyed
+    # preference, stable across firmware structure changes). On boot ESPHome
+    # restores the saved state and replays turn_on/turn_off_action, which
+    # re-syncs the rotate_180 global used by the display lambda.
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
     turn_on_action:
       - globals.set:
           id: rotate_180
@@ -197,14 +267,16 @@ switch:
   - platform: template
     name: "Auto Brightness"
     id: auto_brightness_switch
-    lambda: 'return id(auto_brightness);'
+    icon: "mdi:brightness-auto"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
     turn_on_action:
       - globals.set:
           id: auto_brightness
           value: 'true'
-      # Apply immediately using the latest sensor value rather than waiting
-      # for the next BH1750 update.
-      - component.update: ambient_light
+      # Apply immediately using the cached last_lux instead of waiting for
+      # the next (filtered, throttled) sensor publish.
+      - script.execute: apply_auto_brightness
     turn_off_action:
       - globals.set:
           id: auto_brightness
@@ -214,6 +286,7 @@ number:
   - platform: template
     name: "Brightness Bias"
     id: brightness_bias_number
+    icon: "mdi:tune-vertical"
     optimistic: true
     restore_value: true
     initial_value: 1.0
@@ -226,18 +299,13 @@ number:
         - globals.set:
             id: brightness_bias
             value: !lambda 'return x;'
-        # Re-apply auto brightness so the slider's effect is visible right
-        # away (otherwise it waits for the next BH1750 reading).
-        - if:
-            condition:
-              lambda: 'return id(auto_brightness);'
-            then:
-              - component.update: ambient_light
+        - script.execute: apply_auto_brightness
 
 select:
   - platform: template
     name: "Clock Mode"
     id: clock_mode_select
+    icon: "mdi:palette"
     optimistic: true
     restore_value: true
     options:
@@ -254,50 +322,41 @@ select:
             else if (x == "Bicolor") id(clock_mode) = 2;
             else if (x == "Waves")   id(clock_mode) = 3;
 
-# LED strip: 65 bottle-cap positions along one data line, 3 RGB LEDs per cap (195 total).
-# Layout along the strip: digit0 (15 caps), digit1 (15), colon (5), digit2 (15), digit3 (15).
-# Each digit is drawn from a 5-row x 3-column visual bitmap (strings of '0'/'1').
-# ROW_COL_TO_CAP maps (row,col) to cap index within that digit: left column top->bottom,
-# middle column bottom->top, right column top->bottom (column-serpentine wiring).
-
-# Clock segment LEDs on IO16
+# ----------------------------------------------------------------------------
+# LED strip
+#
+# Layout along the data line (65 caps, 3 LEDs per cap, 195 LEDs total):
+#   digit0 (15 caps)  digit1 (15)  colon (5)  digit2 (15)  digit3 (15)
+#
+# Each digit's caps are wired column-serpentine:
+#   col 0 top -> bottom    (caps 0..4 within the digit)
+#   col 1 bottom -> top    (caps 5..9)
+#   col 2 top -> bottom    (caps 10..14)
+# ROW_COL_TO_CAP encodes that mapping. See README for the visual diagram.
+# ----------------------------------------------------------------------------
 light:
-  # Use ESPHome's native esp32_rmt_led_strip driver. It uses the new ESP-IDF
-  # RMT TX driver, which is the supported path for WS2812 on the ESP32-S3.
-  # (NeoPixelBus's esp32_rmt method uses the legacy RMT driver and produced
-  # unreliable timing on this board past ~15 LEDs, with garbage colors that
-  # changed between reboots.)
   - platform: esp32_rmt_led_strip
-    chipset: WS2812
-    rgb_order: GRB
-    pin: GPIO16
-    num_leds: 195
     name: "Clock LEDs"
     id: clock_leds
+    pin: ${led_pin}
+    chipset: WS2812
+    rgb_order: GRB
+    num_leds: 195
     default_transition_length: 0s
     gamma_correct: 1.0
-    # Persist the user's chosen color and brightness across reboots. On the
-    # very first boot (no saved state), the light defaults to on/full white,
-    # so set a sensible color and brightness from the web UI immediately
-    # after first flash to avoid drawing too much current.
+    # Persist the user's chosen color and brightness across reboots.
     restore_mode: RESTORE_DEFAULT_ON
-    # ESP32-S3: stream via DMA so Wi-Fi/other interrupts can't cause RMT
-    # buffer underruns mid-frame. rmt_symbols is the DMA chunk size in bits;
-    # 1024 is the largest the new ESP-IDF RMT TX driver accepts here (4800
-    # tripped "invalid argument" / TX timeout). 1024 gives ~42 LEDs per chunk
-    # vs. ~8 at the old default of 192, so descriptor-boundary timing slips
-    # are about 5x rarer. SRAM-backed framebuffer (use_psram: false) avoids
-    # PSRAM cache-miss latency contributing to bit-timing jitter.
+    # ESP32-S3 timing: stream via DMA so Wi-Fi / scheduler interrupts can't
+    # cause RMT buffer underruns mid-frame. rmt_symbols is the DMA chunk size
+    # in bits; 1024 is the largest the new ESP-IDF RMT TX driver accepts here.
+    # use_psram: false keeps the framebuffer in SRAM for deterministic access.
     use_dma: true
     rmt_symbols: 1024
     use_psram: false
     effects:
-      # Walks one bottle cap at a time through all 65 caps. 1.5s per cap.
-      # Logs the cap index on the serial console. Use this to read off the physical
-      # cap-to-cap-index mapping so we can fix ROW_COL_TO_CAP from observation.
-      #
-      # Color is hard-coded dim white. Each cap is 3 consecutive LEDs:
-      #   cap N occupies physical LEDs [3N, 3N+1, 3N+2].
+      # Diagnostic: walk one cap at a time through all 65 caps, 1.5s per step,
+      # logging the cap index. Use this if you suspect a wiring or mapping
+      # issue - it lets you read off the physical-to-logical cap order.
       - addressable_lambda:
           name: "Cap Walk"
           update_interval: 1500ms
@@ -313,178 +372,18 @@ light:
             for (int i = 0; i < NUM_LEDS; i++) {
               it[i] = off;
             }
-
             int base = s_cap * LEDS_PER_CAP;
             it[base + 0] = on;
             it[base + 1] = on;
             it[base + 2] = on;
 
-            ESP_LOGI("cap_walk", "cap=%d  leds=%d,%d,%d", s_cap, base, base + 1, base + 2);
+            ESP_LOGI("cap_walk", "cap=%d  leds=%d,%d,%d",
+                     s_cap, base, base + 1, base + 2);
             s_cap = (s_cap + 1) % NUM_CAPS;
 
-      # Normal clock display: HH:MM driven by SNTP, with a softly pulsing colon.
-      # Caches the last valid time so a brief SNTP desync doesn't blank the display.
-      - addressable_lambda:
-          name: "Clock Display"
-          update_interval: 50ms
-          lambda: |-
-            static const uint8_t ROW_COL_TO_CAP[5][3] = {
-                {0, 9, 10},
-                {1, 8, 11},
-                {2, 7, 12},
-                {3, 6, 13},
-                {4, 5, 14},
-            };
-            static const char *const DIGITS[10][5] = {
-                {"111", "101", "101", "101", "111"},  // 0
-                {"001", "001", "001", "001", "001"},  // 1
-                {"111", "001", "111", "100", "111"},  // 2
-                {"111", "001", "111", "001", "111"},  // 3
-                {"101", "101", "111", "001", "001"},  // 4
-                {"111", "100", "111", "001", "111"},  // 5
-                {"111", "100", "111", "101", "111"},  // 6
-                {"111", "001", "001", "001", "001"},  // 7
-                {"111", "101", "111", "101", "111"},  // 8
-                {"111", "101", "111", "001", "111"},  // 9
-            };
-            static const int DIGIT_OFFSET[4] = {0, 15, 35, 50};
-            static const int COLON_OFFSET = 30;
-            static const int COLON_CAPS = 5;
-            static const int LEDS_PER_CAP = 3;
-
-            static int s_hour = 0;
-            static int s_minute = 0;
-            static bool s_have_time = false;
-
-            auto now = id(sntp_time).now();
-            if (now.is_valid()) {
-              s_hour = now.hour;
-              s_minute = now.minute;
-              s_have_time = true;
-            }
-
-            it.all() = Color(0, 0, 0);
-            if (!s_have_time) {
-              return;
-            }
-
-            int digits[4] = {
-              s_hour / 10,
-              s_hour % 10,
-              s_minute / 10,
-              s_minute % 10,
-            };
-
-            auto paint_cap = [&](int cap, Color color) {
-              int base = cap * LEDS_PER_CAP;
-              it[base + 0] = color;
-              it[base + 1] = color;
-              it[base + 2] = color;
-            };
-
-            // Visible left-to-right column for each logical (digit, col) cell, plus
-            // the colon column. Used by spatial modes (Rainbow, Waves) so gradients
-            // align with what the eye sees, regardless of strip order or rotation.
-            //   digit 0 -> x 0..2   digit 1 -> 3..5   colon -> 6
-            //   digit 2 -> x 7..9   digit 3 -> 10..12
-            static const int DIGIT_X_OFFSET[4] = {0, 3, 7, 10};
-            static const int COLON_X = 6;
-            static const float DISPLAY_W = 13.0f;
-
-            int mode = id(clock_mode);
-            float t_ms = (float)millis();
-
-            // User's brightness 0..1 (without color). Rainbow mode uses this to
-            // scale full-saturation HSV without double-applying current_color's
-            // already-baked-in brightness.
-            float user_brightness = id(clock_leds).current_values.get_brightness();
-
-            auto hsv_to_color = [](float h, float s, float v) -> Color {
-              h = h - floorf(h);
-              float r = 0, g = 0, b = 0;
-              int i = (int)(h * 6.0f);
-              float f = h * 6.0f - i;
-              float p = v * (1.0f - s);
-              float q = v * (1.0f - f * s);
-              float u = v * (1.0f - (1.0f - f) * s);
-              switch (i % 6) {
-                case 0: r = v; g = u; b = p; break;
-                case 1: r = q; g = v; b = p; break;
-                case 2: r = p; g = v; b = u; break;
-                case 3: r = p; g = q; b = v; break;
-                case 4: r = u; g = p; b = v; break;
-                case 5: r = v; g = p; b = q; break;
-              }
-              return Color((uint8_t)(r * 255.0f), (uint8_t)(g * 255.0f), (uint8_t)(b * 255.0f));
-            };
-
-            auto scale_color = [](Color c, float k) -> Color {
-              if (k < 0.0f) k = 0.0f;
-              if (k > 1.0f) k = 1.0f;
-              return Color((uint8_t)(c.r * k), (uint8_t)(c.g * k), (uint8_t)(c.b * k));
-            };
-
-            // Bicolor secondary = current_color with channels rotated R<-G<-B<-R.
-            // Cheap, brightness-preserving, and visibly distinct from the primary.
-            Color minutes_color = Color(current_color.g, current_color.b, current_color.r);
-
-            // Returns the color a lit cell at visible column x should display,
-            // given which logical position it belongs to (0=H tens, 1=H ones,
-            // 2=M tens, 3=M ones, -1=colon).
-            auto color_for = [&](int x, int logical_d) -> Color {
-              switch (mode) {
-                case 1: { // Rainbow: hue = position + slow time drift (~30s/cycle)
-                  float h = ((float)x / DISPLAY_W) - (t_ms / 30000.0f);
-                  return scale_color(hsv_to_color(h, 1.0f, 1.0f), user_brightness);
-                }
-                case 2: { // Bicolor: hours = primary, minutes = rotated; colon = primary
-                  if (logical_d == 2 || logical_d == 3) return minutes_color;
-                  return current_color;
-                }
-                case 3: { // Waves: 0.4..1.0 sine across x, drifting left over time
-                  float w = 0.7f + 0.3f * sinf((float)x * 0.6f - t_ms / 1200.0f);
-                  return scale_color(current_color, w);
-                }
-                default:  // Mono
-                  return current_color;
-              }
-            };
-
-            // 180-degree rotation: swap digit order (0<->3, 1<->2) and flip the
-            // (row, col) inside each digit. Mode coloring uses logical (visible)
-            // coordinates, so the rainbow/wave/bicolor layout always matches what
-            // the user reads, regardless of rotation.
-            bool rotate = id(rotate_180);
-            for (int d = 0; d < 4; d++) {
-              int phys_d = rotate ? (3 - d) : d;
-              int offset = DIGIT_OFFSET[phys_d];
-              int n = digits[d];
-              for (int row = 0; row < 5; row++) {
-                for (int col = 0; col < 3; col++) {
-                  if (DIGITS[n][row][col] == '1') {
-                    int phys_row = rotate ? (4 - row) : row;
-                    int phys_col = rotate ? (2 - col) : col;
-                    int x = DIGIT_X_OFFSET[d] + col;
-                    paint_cap(offset + ROW_COL_TO_CAP[phys_row][phys_col],
-                              color_for(x, d));
-                  }
-                }
-              }
-            }
-
-            // Colon: 5 caps tall, light the upper and lower dot positions (1 and 3)
-            // with a smooth 0.5 Hz fade (2 s period) so it reads like a clock colon.
-            // Base color comes from the active mode at the colon's visible column.
-            float phase = (millis() % 2000) / 2000.0f;
-            float fade = 0.5f * (1.0f - cosf(phase * 2.0f * 3.14159265f));
-            Color colon_base = color_for(COLON_X, -1);
-            Color colon_color = scale_color(colon_base, fade);
-            paint_cap(COLON_OFFSET + 1, colon_color);
-            paint_cap(COLON_OFFSET + 3, colon_color);
-            (void)COLON_CAPS;
-
-      # Shows the same digit on all 4 digit positions, advancing 0..9 once per second.
-      # No SNTP, no transitions. Use this to verify the digit bitmap and (row,col) -> cap map.
+      # Diagnostic: cycle a single digit (0..9) on all four positions.
+      # Useful for verifying the digit bitmap and (row, col) -> cap map
+      # without depending on SNTP or color modes.
       - addressable_lambda:
           name: "Digit Test"
           update_interval: 1000ms
@@ -516,7 +415,6 @@ light:
             s_value = (s_value + 1) % 10;
 
             it.all() = Color(0, 0, 0);
-
             for (int d = 0; d < 4; d++) {
               int offset = DIGIT_OFFSET[d];
               for (int row = 0; row < 5; row++) {
@@ -531,3 +429,187 @@ light:
                 }
               }
             }
+
+      # Normal clock display: HH:MM driven by SNTP, colon fades at 0.5 Hz.
+      # Caches the last valid time so a brief SNTP desync doesn't blank the
+      # display. Coloring depends on the active Clock Mode (see select).
+      - addressable_lambda:
+          name: "Clock Display"
+          update_interval: 50ms
+          lambda: |-
+            static const uint8_t ROW_COL_TO_CAP[5][3] = {
+                {0, 9, 10},
+                {1, 8, 11},
+                {2, 7, 12},
+                {3, 6, 13},
+                {4, 5, 14},
+            };
+            static const char *const DIGITS[10][5] = {
+                {"111", "101", "101", "101", "111"},  // 0
+                {"001", "001", "001", "001", "001"},  // 1
+                {"111", "001", "111", "100", "111"},  // 2
+                {"111", "001", "111", "001", "111"},  // 3
+                {"101", "101", "111", "001", "001"},  // 4
+                {"111", "100", "111", "001", "111"},  // 5
+                {"111", "100", "111", "101", "111"},  // 6
+                {"111", "001", "001", "001", "001"},  // 7
+                {"111", "101", "111", "101", "111"},  // 8
+                {"111", "101", "111", "001", "111"},  // 9
+            };
+            static const int DIGIT_OFFSET[4] = {0, 15, 35, 50};
+            static const int COLON_OFFSET = 30;
+            static const int LEDS_PER_CAP = 3;
+
+            // Visible left-to-right column for spatial modes:
+            //   digit 0 -> 0..2   digit 1 -> 3..5   colon -> 6
+            //   digit 2 -> 7..9   digit 3 -> 10..12   width = 13
+            static const int DIGIT_X_OFFSET[4] = {0, 3, 7, 10};
+            static const int COLON_X = 6;
+            static const float DISPLAY_W = 13.0f;
+
+            static int s_hour = 0;
+            static int s_minute = 0;
+            static bool s_have_time = false;
+
+            auto now = id(sntp_time).now();
+            if (now.is_valid()) {
+              s_hour = now.hour;
+              s_minute = now.minute;
+              s_have_time = true;
+            }
+
+            it.all() = Color(0, 0, 0);
+            if (!s_have_time) {
+              return;
+            }
+
+            int digits[4] = {
+              s_hour / 10,
+              s_hour % 10,
+              s_minute / 10,
+              s_minute % 10,
+            };
+
+            auto paint_cap = [&](int cap, Color color) {
+              int base = cap * LEDS_PER_CAP;
+              it[base + 0] = color;
+              it[base + 1] = color;
+              it[base + 2] = color;
+            };
+
+            int mode = id(clock_mode);
+            float t_ms = (float)millis();
+
+            // Rainbow uses raw user brightness because current_color already
+            // bakes brightness in; double-applying would over-dim.
+            float user_brightness =
+                id(clock_leds).current_values.get_brightness();
+
+            auto hsv_to_color = [](float h, float s, float v) -> Color {
+              h = h - floorf(h);
+              float r = 0, g = 0, b = 0;
+              int i = (int)(h * 6.0f);
+              float f = h * 6.0f - i;
+              float p = v * (1.0f - s);
+              float q = v * (1.0f - f * s);
+              float u = v * (1.0f - (1.0f - f) * s);
+              switch (i % 6) {
+                case 0: r = v; g = u; b = p; break;
+                case 1: r = q; g = v; b = p; break;
+                case 2: r = p; g = v; b = u; break;
+                case 3: r = p; g = q; b = v; break;
+                case 4: r = u; g = p; b = v; break;
+                case 5: r = v; g = p; b = q; break;
+              }
+              return Color((uint8_t)(r * 255.0f),
+                           (uint8_t)(g * 255.0f),
+                           (uint8_t)(b * 255.0f));
+            };
+
+            auto scale_color = [](Color c, float k) -> Color {
+              if (k < 0.0f) k = 0.0f;
+              if (k > 1.0f) k = 1.0f;
+              return Color((uint8_t)(c.r * k),
+                           (uint8_t)(c.g * k),
+                           (uint8_t)(c.b * k));
+            };
+
+            // Bicolor secondary = primary with channels rotated R<-G<-B<-R.
+            // Brightness-preserving and visibly distinct from the primary.
+            Color minutes_color = Color(current_color.g,
+                                         current_color.b,
+                                         current_color.r);
+
+            auto color_for = [&](int x, int logical_d) -> Color {
+              switch (mode) {
+                case 1: { // Rainbow: hue = position + 30s drift
+                  float h = ((float)x / DISPLAY_W) - (t_ms / 30000.0f);
+                  return scale_color(hsv_to_color(h, 1.0f, 1.0f),
+                                     user_brightness);
+                }
+                case 2: { // Bicolor: hours = primary, minutes = rotated.
+                  // Colon (logical_d == -1) alternates each blink so the
+                  // dots cycle between the two colors over time.
+                  if (logical_d == -1) {
+                    int blink = (int)(t_ms / 2000.0f);
+                    return (blink & 1) ? minutes_color : current_color;
+                  }
+                  if (logical_d == 2 || logical_d == 3) return minutes_color;
+                  return current_color;
+                }
+                case 3: { // Waves: visible brightness sweep + gentle hue drift.
+                  // Brightness floor is 0.5 so digits with few lit caps
+                  // (notably "1") stay readable through the dip. Range
+                  // 0.5..1.0.
+                  float w = 0.75f + 0.25f * sinf((float)x * 0.6f -
+                                                 t_ms / 1200.0f);
+                  // Color shift: cross-blend up to 20% with a channel-
+                  // rotated copy of the user color. Subtle hue motion that
+                  // stays anchored to the chosen color.
+                  float c = 0.10f + 0.10f * sinf((float)x * 0.4f -
+                                                 t_ms / 2500.0f);
+                  Color alt = Color(current_color.b,
+                                    current_color.r,
+                                    current_color.g);
+                  uint8_t r = (uint8_t)(current_color.r * (1.0f - c) +
+                                        alt.r * c);
+                  uint8_t g = (uint8_t)(current_color.g * (1.0f - c) +
+                                        alt.g * c);
+                  uint8_t b = (uint8_t)(current_color.b * (1.0f - c) +
+                                        alt.b * c);
+                  return scale_color(Color(r, g, b), w);
+                }
+                default:  // Mono
+                  return current_color;
+              }
+            };
+
+            // 180-degree rotation: swap digit order and flip (row, col).
+            // Mode coloring uses logical/visible coordinates so gradients
+            // always read correctly regardless of rotation.
+            bool rotate = id(rotate_180);
+            for (int d = 0; d < 4; d++) {
+              int phys_d = rotate ? (3 - d) : d;
+              int offset = DIGIT_OFFSET[phys_d];
+              int n = digits[d];
+              for (int row = 0; row < 5; row++) {
+                for (int col = 0; col < 3; col++) {
+                  if (DIGITS[n][row][col] == '1') {
+                    int phys_row = rotate ? (4 - row) : row;
+                    int phys_col = rotate ? (2 - col) : col;
+                    int x = DIGIT_X_OFFSET[d] + col;
+                    paint_cap(offset + ROW_COL_TO_CAP[phys_row][phys_col],
+                              color_for(x, d));
+                  }
+                }
+              }
+            }
+
+            // Colon: light caps 1 and 3 of the 5-cap column with a 0.5 Hz
+            // (2 s period) cosine fade in the active mode's color.
+            float phase = (millis() % 2000) / 2000.0f;
+            float fade = 0.5f * (1.0f - cosf(phase * 2.0f * 3.14159265f));
+            Color colon_base = color_for(COLON_X, -1);
+            Color colon_color = scale_color(colon_base, fade);
+            paint_cap(COLON_OFFSET + 1, colon_color);
+            paint_cap(COLON_OFFSET + 3, colon_color);
