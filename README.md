@@ -1,5 +1,7 @@
 # Bottle Cap Clock
 
+![Bottle Cap Clock](doc/hero.jpeg)
+
 A 4-digit Wi-Fi clock that uses recycled PET bottle caps as diffusers over a
 WS2812 LED matrix. Time comes from SNTP, the display is driven by ESPHome on
 a custom ESP32-S3 board, and all configuration is exposed through the ESPHome
