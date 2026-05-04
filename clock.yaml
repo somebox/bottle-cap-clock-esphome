@@ -21,7 +21,7 @@ substitutions:
   friendly_name: "Bottle Cap Clock"
   # Project version - bump on every release so OTA updates show up correctly
   # in the ESPHome dashboard / Home Assistant.
-  project_version: "1.1.5"
+  project_version: "1.2.2"
   # IANA tz database name. See:
   # https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
   timezone: "Europe/Berlin"
@@ -70,11 +70,14 @@ esphome:
       # instead of initial_value. Clamp to the entity's valid range
       # before we sync the number entities below.
       - lambda: |-
-          if (id(brightness_bias) < 0.5f || id(brightness_bias) > 2.0f) {
+          if (id(brightness_bias) < 0.5f || id(brightness_bias) > 3.0f) {
             id(brightness_bias) = 1.0f;
           }
           if (id(max_brightness) < 0.3f || id(max_brightness) > 1.0f) {
             id(max_brightness) = 0.85f;
+          }
+          if (id(saturation_lux) < 50.0f || id(saturation_lux) > 2000.0f) {
+            id(saturation_lux) = 250.0f;
           }
       # Sync the user-facing number entities from their backing globals.
       # The globals own persistence (reliable across reboots/OTAs); the
@@ -86,6 +89,9 @@ esphome:
       - number.set:
           id: max_brightness_number
           value: !lambda 'return id(max_brightness);'
+      - number.set:
+          id: saturation_lux_number
+          value: !lambda 'return id(saturation_lux);'
       # Wait a few seconds so the API/HA connection has had time to come up,
       # then announce why the previous run ended. We log at WARN level (so it
       # shows up in `esphome logs` even without HA) and publish to the
@@ -311,16 +317,53 @@ script:
               - lambda: 'return id(clock_leds).remote_values.is_on();'
           then:
             - lambda: |-
-                // Log-lux to brightness curve:
-                //   1 lux -> 5%, 10 -> 29%, 100 -> 53%,
-                //   1000 -> 77%, 10000+ -> 100%. Linear in log10(lux).
+                // Auto-brightness curve, lux -> HA brightness:
+                //
+                //   ratio  = clamp(lux / saturation_lux, 0, 1)
+                //   target = FLOOR + ratio^p * (1 - FLOOR) * bias
+                //
+                // Two independent controls:
+                //   * saturation_lux = the lux at which the curve
+                //     reaches max brightness. Sets the horizontal
+                //     scale of the curve: lower sat = clock hits
+                //     full brightness in dimmer rooms; higher sat =
+                //     more headroom for bright rooms. The natural
+                //     ^p slope rolls off smoothly as lux approaches
+                //     sat, so there's no hard-knee artifact at the
+                //     top.
+                //   * brightness_bias = uniform make-up gain.
+                //     Multiplies the lit_bonus across the whole
+                //     curve. Doubling bias doubles the brightness
+                //     at every lux level below the max-brightness
+                //     cap. Useful for compensating for sensor
+                //     placement / room type without touching the
+                //     curve's saturation point.
+                //
+                // FLOOR (B=1 = one LED per cap at PWM 1) is the
+                // dark-room minimum and is never scaled by bias, so
+                // a pitch-dark room always lands at B=1.
+                //
+                // Examples at sat=250, bias=1.0, max_b=1.0:
+                //   lux=0   -> B=1     lux=1.5 -> B=1
+                //   lux=10  -> B=3     lux=50  -> B=24
+                //   lux=100 -> B=65    lux=200 -> B=183
+                //   lux=250+ -> B=255
+                const float FLOOR = 1.0f / 255.0f;
+                const float CURVE_P = 1.5f;
+
                 float lux = id(last_lux);
-                if (lux < 0.5f) lux = 0.5f;
-                float target = 0.05f + log10f(lux) * 0.24f;
-                target *= id(brightness_bias);
+                if (lux < 0.0f) lux = 0.0f;
+                float sat = id(saturation_lux);
+                if (sat < 1.0f) sat = 1.0f;
+
+                float ratio = lux / sat;
+                if (ratio > 1.0f) ratio = 1.0f;
+                float lit_bonus =
+                    powf(ratio, CURVE_P) * (1.0f - FLOOR);
+
+                float target = FLOOR + lit_bonus * id(brightness_bias);
                 float max_b = id(max_brightness);
                 if (target > max_b) target = max_b;
-                if (target < 0.02f) target = 0.02f;
                 auto call = id(clock_leds).turn_on();
                 call.set_brightness(target);
                 call.set_transition_length(2000);
@@ -353,6 +396,13 @@ globals:
     type: float
     restore_value: true
     initial_value: '0.85'
+  # Lux at which the auto-brightness curve reaches max (at bias 1.0).
+  # Higher values stretch the curve over brighter rooms; lower values
+  # make the clock saturate sooner so dim rooms still hit max.
+  - id: saturation_lux
+    type: float
+    restore_value: true
+    initial_value: '250.0'
   # Most recent raw lux from the BH1750. Updated on every sample (pre-filter)
   # so auto-brightness and the bias slider can react immediately without
   # waiting for the throttled, smoothed published value.
@@ -402,13 +452,35 @@ number:
     icon: "mdi:tune-vertical"
     optimistic: true
     min_value: 0.5
-    max_value: 2.0
+    max_value: 3.0
     step: 0.05
     mode: slider
     on_value:
       then:
         - globals.set:
             id: brightness_bias
+            value: !lambda 'return x;'
+        - script.execute: apply_auto_brightness
+
+  - platform: template
+    name: "Saturation Lux"
+    id: saturation_lux_number
+    icon: "mdi:weather-sunny"
+    optimistic: true
+    min_value: 50
+    max_value: 2000
+    step: 10
+    mode: slider
+    # Lux limiter: any room brighter than this is treated as if it
+    # were exactly this bright. Below the threshold the curve is
+    # untouched. Use it as a ceiling -- e.g. set to 200 to keep the
+    # clock at "well-lit indoor" brightness even in direct sun.
+    # Curve shape is fixed (REFERENCE_LUX=250 in the lambda); tune
+    # the overall response with Brightness Bias.
+    on_value:
+      then:
+        - globals.set:
+            id: saturation_lux
             value: !lambda 'return x;'
         - script.execute: apply_auto_brightness
 
@@ -678,31 +750,26 @@ light:
             int mode = id(clock_mode);
             float t_ms = (float)millis();
 
-            // Rainbow uses raw user brightness because current_color already
-            // bakes brightness in; double-applying would over-dim.
+            // User brightness as a 0..1 float. We translate this to
+            // an integer 0..255 level (B) further down so the
+            // sub-pixel ladder (1..3 LEDs at the dimmest end) maps
+            // cleanly onto HA's 0..255 brightness scale.
             float user_brightness =
                 id(clock_leds).current_values.get_brightness();
 
-            // Hard max-brightness cap. If the user's setting is above the
-            // cap, scale all emitted colors by (max / user). If it's at or
-            // below, do nothing -- it's a cap, not a global dim.
-            //   non_rainbow_scale: multiplies colors derived from
-            //     current_color (which already has user_brightness baked
-            //     in), so only the excess is trimmed.
-            //   eff_brightness: the effective brightness to use where we
-            //     drive brightness directly (rainbow).
+            // Hard max-brightness cap. eff_brightness is the user's
+            // brightness clamped to max_b; primary and rainbow are
+            // both built from eff_brightness so the cap applies
+            // uniformly across modes without any second scaling pass.
             // Safety: if max_brightness is out of the slider's range
-            // (e.g. a corrupted preference came back as 0), fall back to
-            // the safe default instead of blanking the display or lifting
-            // the cap entirely. on_boot also clamps to this same value.
+            // (e.g. a corrupted preference came back as 0), fall back
+            // to the safe default instead of blanking the display or
+            // lifting the cap entirely. on_boot also clamps to this
+            // same value.
             float max_b = id(max_brightness);
             if (max_b < 0.3f || max_b > 1.0f) max_b = 0.85f;
             float eff_brightness = user_brightness < max_b ? user_brightness
                                                            : max_b;
-            float non_rainbow_scale = 1.0f;
-            if (user_brightness > 0.001f && user_brightness > max_b) {
-              non_rainbow_scale = max_b / user_brightness;
-            }
 
             // HSV->RGB that keeps values as floats in 0..255. Letting
             // paint_cap do the final cast preserves sub-1 channel values
@@ -731,21 +798,46 @@ light:
               return FC{c.r * k, c.g * k, c.b * k};
             };
 
-            // The user's chosen colour as floats. current_color already
-            // has user_brightness baked in.
-            FC primary{(float)current_color.r,
-                       (float)current_color.g,
-                       (float)current_color.b};
+            // Brightness mapping (0..255 from HA):
+            //   0     -> off
+            //   1..3  -> 1, 2, 3 LEDs lit per cap, all at PWM 1
+            //   >= 4  -> 3 LEDs lit per cap, PWM = B - 2
+            // This extends the dimmest visible range by 3 sub-steps
+            // below what a single LED at PWM 1 can do alone. The
+            // (3 -> 6) jump from B=3 to B=4 doesn't matter at this
+            // level. We feed paint_cap an FC whose max channel = X,
+            // and let paint_cap's existing thresholds take it from
+            // there:
+            //   X = 0.333 -> n=1, PWM=1
+            //   X = 0.667 -> n=2, PWM=1
+            //   X = 1.0   -> n=3, PWM=1   (Normal path)
+            //   X = 2.0   -> n=3, PWM=2   (Normal path)
+            //   ...
+            int B = (int)roundf(eff_brightness * 255.0f);
+            float X;
+            if (B <= 0)      X = 0.0f;
+            else if (B <= 3) X = (float)B / 3.0f;
+            else             X = (float)(B - 2);
+
+            auto &vals = id(clock_leds).current_values;
+            float cb = vals.get_color_brightness();
+            FC primary{vals.get_red()   * cb * X,
+                       vals.get_green() * cb * X,
+                       vals.get_blue()  * cb * X};
             // Bicolor secondary = primary with channels rotated
             // R<-G<-B<-R. Brightness-preserving and visibly distinct.
             FC minutes_fc{primary.g, primary.b, primary.r};
 
             auto color_for = [&](int x, int logical_d) -> FC {
               switch (mode) {
-                case 1: { // Rainbow: hue = position + 30s drift
+                case 1: { // Rainbow: hue = position + 30s drift.
+                  // hsv_to_fc returns 0..255; scale by X/255 so the
+                  // max channel lands at X (same brightness model as
+                  // primary), keeping rainbow consistent with the
+                  // sub-pixel mapping in paint_cap.
                   float h = ((float)x / DISPLAY_W) - (t_ms / 30000.0f);
                   return scale_fc(hsv_to_fc(h, 1.0f, 1.0f),
-                                  eff_brightness);
+                                  X / 255.0f);
                 }
                 case 2: { // Bicolor: hours = primary, minutes = rotated.
                   // Colon (logical_d == -1) alternates each blink so the
@@ -759,7 +851,7 @@ light:
                   } else {
                     base = primary;
                   }
-                  return scale_fc(base, non_rainbow_scale);
+                  return base;
                 }
                 case 3: { // Waves: visible brightness sweep + gentle hue drift.
                   // Brightness floor is 0.5 so digits with few lit caps
@@ -776,10 +868,10 @@ light:
                   FC mixed{primary.r * (1.0f - c) + alt.r * c,
                            primary.g * (1.0f - c) + alt.g * c,
                            primary.b * (1.0f - c) + alt.b * c};
-                  return scale_fc(mixed, w * non_rainbow_scale);
+                  return scale_fc(mixed, w);
                 }
                 default:  // Mono
-                  return scale_fc(primary, non_rainbow_scale);
+                  return primary;
               }
             };
 

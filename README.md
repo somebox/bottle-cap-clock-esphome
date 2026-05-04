@@ -63,12 +63,67 @@ All user-facing settings live in the web UI (and mirror to Home Assistant):
 | Clock Mode | select | `Mono`, `Rainbow`, `Bicolor`, `Waves`. Persists across reboots. |
 | Rotate 180 | switch | Flips the display for upside-down mounting. |
 | Auto Brightness | switch | Drives brightness from the BH1750 lux reading. |
-| Brightness Bias | number | Multiplier (0.5..2.0) applied to the auto-brightness curve so you can compensate for sensor placement. |
+| Brightness Bias | number | Make-up gain on the auto-brightness curve (0.5..3.0). Doubles brightness across the whole curve when doubled. |
+| Saturation Lux | number | Lux at which the curve reaches max brightness (50..2000). Lower = clock saturates earlier; higher = stretched response for bright rooms. |
+| Max Brightness | number | Hard cap on the light output (0.30..1.00). Applies to manual and auto control. |
 | Ambient Light | sensor | Raw lux reading from the BH1750. |
 | User Button | binary_sensor | The button on the back of the board. Not bound to anything by default. |
 
 For deeper changes (timezone, GPIO assignments, project name) edit the
 `substitutions:` block at the top of `clock.yaml`.
+
+### Auto-brightness curve
+
+When **Auto Brightness** is on, the firmware maps lux from the BH1750 into the
+clock's 0..255 brightness on a smooth curve. Two orthogonal controls shape it:
+
+- **Saturation Lux** sets the curve's horizontal scale: it is the lux value
+  at which the curve reaches max brightness. Lower values compress the curve
+  so the clock saturates earlier (good for permanently dim rooms); higher
+  values stretch it (good for sunlit rooms where you want headroom). Above
+  Saturation Lux the output stays flat — there is no overshoot.
+- **Brightness Bias** is **uniform make-up gain**. It scales the curve up or
+  down without changing where it saturates. Doubling the bias roughly doubles
+  the brightness at every lux level (until clamped by Max Brightness). It does
+  *not* lift the dark-room floor: a pitch-dark room always lands at B=1 (one
+  tiny dot per cap) regardless of bias.
+
+![Auto-brightness curve](doc/auto-brightness-curve.svg)
+
+The left panel shows how Brightness Bias scales the whole curve up and down
+without moving its saturation point. The right panel shows how Saturation
+Lux changes where the curve reaches max brightness: lower values pull the
+"knee" inward, higher values push it out. Tune the response with the two
+sliders rather than editing the lambda.
+
+The curve is gentle at the dim end on purpose. Below ~10 lux only one or two
+LEDs per cap are lit, walking through the *sub-pixel ladder* the firmware
+exposes:
+
+| HA brightness `B` | Per-cap output |
+|---|---|
+| 0 | Off |
+| 1 | 1 LED at PWM 1 |
+| 2 | 2 LEDs at PWM 1 |
+| 3 | 3 LEDs at PWM 1 |
+| ≥4 | 3 LEDs at PWM `B - 2` |
+
+This extends the dim end of the WS2812's PWM range by three sub-steps that
+would otherwise be unreachable.
+
+The Python tests in `tests/test_brightness_mapping.py` mirror this math and
+verify the curve, the saturation point, the make-up-gain property of bias,
+and the sub-pixel ladder. Re-run them after curve changes:
+
+```bash
+python3 tests/test_brightness_mapping.py
+```
+
+To regenerate the chart after editing constants:
+
+```bash
+python3 tools/plot_brightness_curve.py
+```
 
 ### Local development with hardcoded Wi-Fi
 
@@ -125,11 +180,16 @@ The colon lights caps 1 and 3 of its column and fades at 0.5 Hz.
 
 ## Project structure
 
-```
-clock.yaml             Main ESPHome configuration
-secrets.yaml.example   Optional Wi-Fi credentials template
-setup.sh               Creates venv/ and installs esphome
-requirements.txt       Python dependencies (esphome only)
+```text
+clock.yaml                       Main ESPHome configuration
+doc/                             Documentation, diagrams, photos
+  esphome-led-best-practices.md  Notes on driver, mapping, persistence
+  auto-brightness-curve.svg      Reference chart for the lux curve
+tests/test_brightness_mapping.py Verifies the brightness math
+tools/plot_brightness_curve.py   Regenerates the SVG chart
+secrets.yaml.example             Optional Wi-Fi credentials template
+setup.sh                         Creates venv/ and installs esphome
+requirements.txt                 Python dependencies (esphome only)
 ```
 
 If you change the layout or add features, the diagnostic effects in
@@ -162,5 +222,9 @@ PRs welcome. Things that would be useful:
 
 - Per-minute / per-hour transition animations (plasma wipe, sparkle, etc.)
 - Optional 12 h format and AM/PM indicator
-- Brightness curve presets (linear, perceptual, custom)
+- Auto-brightness curve presets (linear, perceptual, night-only)
 - Schematic and PCB files for the carrier board
+
+See also `doc/esphome-led-best-practices.md` for the design notes and
+lessons learned that inform the firmware (driver choice, pixel mapping,
+sub-pixel dimming, sensor smoothing, persistence pitfalls).
