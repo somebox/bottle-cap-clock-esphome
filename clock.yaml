@@ -21,7 +21,7 @@ substitutions:
   friendly_name: "Bottle Cap Clock"
   # Project version - bump on every release so OTA updates show up correctly
   # in the ESPHome dashboard / Home Assistant.
-  project_version: "1.0.0"
+  project_version: "1.1.5"
   # IANA tz database name. See:
   # https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
   timezone: "Europe/Berlin"
@@ -46,13 +46,18 @@ esphome:
     priority: -100
     then:
       # Quick double blink of the heartbeat LED so you can see the firmware
-      # actually started, even before Wi-Fi / network come up.
-      - output.turn_on: heartbeat_led
-      - delay: 200ms
+      # actually started, even before Wi-Fi / network come up. Dim level
+      # matches the steady-state heartbeat.
+      - output.set_level:
+          id: heartbeat_led
+          level: 3%
+      - delay: 150ms
       - output.turn_off: heartbeat_led
-      - delay: 200ms
-      - output.turn_on: heartbeat_led
-      - delay: 200ms
+      - delay: 150ms
+      - output.set_level:
+          id: heartbeat_led
+          level: 3%
+      - delay: 150ms
       - output.turn_off: heartbeat_led
       # Force the clock effect on boot so the strip doesn't get stuck on a
       # diagnostic effect (Cap Walk / Digit Test) from a previous session.
@@ -60,6 +65,49 @@ esphome:
       - light.turn_on:
           id: clock_leds
           effect: "Clock Display"
+      # Defensive clamp: on first boot after a firmware upgrade the
+      # preferences slot for a newly-added global can come back as 0.0
+      # instead of initial_value. Clamp to the entity's valid range
+      # before we sync the number entities below.
+      - lambda: |-
+          if (id(brightness_bias) < 0.5f || id(brightness_bias) > 2.0f) {
+            id(brightness_bias) = 1.0f;
+          }
+          if (id(max_brightness) < 0.3f || id(max_brightness) > 1.0f) {
+            id(max_brightness) = 0.85f;
+          }
+      # Sync the user-facing number entities from their backing globals.
+      # The globals own persistence (reliable across reboots/OTAs); the
+      # entities are initialised from them here so HA sees the correct
+      # value immediately on connect.
+      - number.set:
+          id: brightness_bias_number
+          value: !lambda 'return id(brightness_bias);'
+      - number.set:
+          id: max_brightness_number
+          value: !lambda 'return id(max_brightness);'
+      # Wait a few seconds so the API/HA connection has had time to come up,
+      # then announce why the previous run ended. We log at WARN level (so it
+      # shows up in `esphome logs` even without HA) and publish to the
+      # diagnostic text sensor (so it lands in HA history).
+      - delay: 5s
+      - lambda: |-
+          const char *reason;
+          switch (esp_reset_reason()) {
+            case ESP_RST_POWERON:   reason = "Power-on"; break;
+            case ESP_RST_EXT:       reason = "External reset"; break;
+            case ESP_RST_SW:        reason = "Software reset (OTA / restart)"; break;
+            case ESP_RST_PANIC:     reason = "Exception / panic"; break;
+            case ESP_RST_INT_WDT:   reason = "Interrupt watchdog"; break;
+            case ESP_RST_TASK_WDT:  reason = "Task watchdog"; break;
+            case ESP_RST_WDT:       reason = "Other watchdog"; break;
+            case ESP_RST_DEEPSLEEP: reason = "Deep sleep wake"; break;
+            case ESP_RST_BROWNOUT:  reason = "Brownout"; break;
+            case ESP_RST_SDIO:      reason = "SDIO reset"; break;
+            default:                reason = "Unknown"; break;
+          }
+          ESP_LOGW("boot", "Last reset reason: %s (code %d)", reason, (int) esp_reset_reason());
+          id(last_reset_reason).publish_state(reason);
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -68,10 +116,13 @@ esp32:
   framework:
     type: arduino
 
-# PSRAM is enabled for general use; the LED strip framebuffer is intentionally
-# kept in SRAM (use_psram: false on the light) for deterministic DMA timing.
+# ESP32-S3-WROOM-1-N16R2 has 2 MB of *quad* SPI PSRAM (the R2 part).
+# A previous "octal" setting silently failed to init (Available: NO in the
+# boot log), which can destabilise Wi-Fi/BLE buffers. The strip framebuffer
+# stays in SRAM (use_psram: false on the light) for deterministic timing;
+# everything else can use PSRAM if it wants.
 psram:
-  mode: octal
+  mode: quad
   speed: 80MHz
 
 logger:
@@ -106,8 +157,14 @@ captive_portal:
 
 improv_serial:
 
-esp32_improv:
-  authorizer: none
+# esp32_improv (BLE-based Wi-Fi provisioning) is intentionally disabled here.
+# It pulls in the full BLE stack which, alongside Wi-Fi + RMT DMA + 50 ms
+# addressable lambda + web_server + api on the Arduino framework, is a known
+# source of ~60 s reboot loops on the ESP32-S3. improv_serial above already
+# covers USB-based provisioning. Re-enable only if you need wireless
+# first-time provisioning and have verified stability on your build.
+# esp32_improv:
+#   authorizer: none
 
 # Dashboard adoption. Point package_import_url at the public raw URL of this
 # file in your fork so users can adopt the device with one click from the
@@ -132,18 +189,23 @@ time:
     timezone: ${timezone}
 
 # Heartbeat LED + 1 Hz blink so the user can tell the device is alive even
-# when the clock display is intentionally dim or off.
+# when the clock display is intentionally dim or off. Driven via LEDC so
+# we can run it at a low duty cycle -- the onboard LED at full drive is
+# distractingly bright in a dim room.
 output:
-  - platform: gpio
+  - platform: ledc
     id: heartbeat_led
     pin: ${heartbeat_pin}
+    frequency: 1000Hz
 
 interval:
   - id: heartbeat_interval
     interval: 1s
     then:
-      - output.turn_on: heartbeat_led
-      - delay: 20ms
+      - output.set_level:
+          id: heartbeat_led
+          level: 3%
+      - delay: 150ms
       - output.turn_off: heartbeat_led
 
 binary_sensor:
@@ -155,11 +217,57 @@ binary_sensor:
       mode: INPUT_PULLUP
       inverted: true
 
+# Diagnostic sensors. These are entity_category: diagnostic so they don't
+# clutter the main UI but show up in the device's diagnostics panel and HA's
+# device page. Useful for catching crashes, brownouts, RF problems.
+text_sensor:
+  - platform: version
+    name: "ESPHome Version"
+    id: esphome_version
+    entity_category: diagnostic
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      entity_category: diagnostic
+  # Populated by on_boot a few seconds after start (when the API is up).
+  # The value visible in HA history right after a reboot tells us *why* the
+  # previous run ended (panic, watchdog, brownout, etc.).
+  - platform: template
+    name: "Last Reset Reason"
+    id: last_reset_reason
+    icon: "mdi:restart-alert"
+    entity_category: diagnostic
+    update_interval: never
+
 # BH1750 ambient light sensor. When "Auto Brightness" is on, on_value drives
 # the clock brightness from a log-lux curve scaled by "Brightness Bias". A
 # 3-sample median filter rejects single-sample spikes (passing shadows, brief
 # reflections) without slowing the response.
 sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: uptime
+    name: "Uptime"
+    id: uptime_sensor
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: internal_temperature
+    name: "Internal Temperature"
+    id: internal_temp
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: template
+    name: "Free Heap"
+    id: free_heap
+    lambda: 'return ESP.getFreeHeap();'
+    update_interval: 30s
+    unit_of_measurement: "B"
+    accuracy_decimals: 0
+    icon: "mdi:memory"
+    entity_category: diagnostic
   - platform: bh1750
     name: "Ambient Light"
     id: ambient_light
@@ -183,31 +291,36 @@ sensor:
         - lambda: 'id(last_lux) = x;'
         - script.execute: apply_auto_brightness
 
-# Recomputes clock brightness from the cached last_lux + brightness_bias.
-# Called whenever a fresh lux sample arrives, when the bias slider moves,
-# or when auto-brightness is toggled on.
+# Recomputes clock brightness from the cached last_lux + brightness_bias,
+# capped by max_brightness. Called whenever a fresh lux sample arrives,
+# when the bias slider moves, or when auto-brightness is toggled on.
+#
+# Guards:
+#   - Auto Brightness switch must be on.
+#   - The light must already be on (remote_values.is_on()). Without this
+#     guard, any lux sample arriving after the user hit Turn Off would
+#     silently turn the light back on via set_brightness().
 script:
   - id: apply_auto_brightness
     mode: restart
     then:
       - if:
           condition:
-            lambda: 'return id(auto_brightness);'
+            and:
+              - switch.is_on: auto_brightness_switch
+              - lambda: 'return id(clock_leds).remote_values.is_on();'
           then:
             - lambda: |-
-                // Log-lux to brightness, sized for the deployed PSU
-                // (USB-only brownouts are a programming-time concern):
+                // Log-lux to brightness curve:
                 //   1 lux -> 5%, 10 -> 29%, 100 -> 53%,
                 //   1000 -> 77%, 10000+ -> 100%. Linear in log10(lux).
                 float lux = id(last_lux);
                 if (lux < 0.5f) lux = 0.5f;
-                float log_lux = log10f(lux);
-                float target = 0.05f + log_lux * 0.24f;
-                if (target < 0.05f) target = 0.05f;
-                if (target > 1.00f) target = 1.00f;
+                float target = 0.05f + log10f(lux) * 0.24f;
                 target *= id(brightness_bias);
+                float max_b = id(max_brightness);
+                if (target > max_b) target = max_b;
                 if (target < 0.02f) target = 0.02f;
-                if (target > 1.00f) target = 1.00f;
                 auto call = id(clock_leds).turn_on();
                 call.set_brightness(target);
                 call.set_transition_length(2000);
@@ -217,10 +330,10 @@ script:
 # the user-facing controls; these globals hold the cached values used by the
 # per-frame display lambda.
 globals:
-  # These mirror the matching switch / select entities so the per-frame
-  # display lambda can branch without going through the entity layer. The
-  # entities own persistence (restore_mode / restore_value); the globals
-  # are re-synced from them on boot via turn_on/turn_off_action.
+  # rotate_180 and clock_mode mirror their switch / select entities so the
+  # per-frame display lambda can branch without going through the entity
+  # layer. The entities own persistence; the globals are re-synced from
+  # them on boot via turn_on/turn_off_action / on_value.
   - id: rotate_180
     type: bool
     restore_value: false
@@ -229,14 +342,17 @@ globals:
     type: int
     restore_value: false
     initial_value: '0'
-  - id: auto_brightness
-    type: bool
-    restore_value: false
-    initial_value: 'false'
+  # brightness_bias and max_brightness OWN their persistence (globals'
+  # restore_value is reliable across reboots/OTAs). The matching number
+  # entities are synced FROM these on boot and write back here on change.
   - id: brightness_bias
     type: float
-    restore_value: false
+    restore_value: true
     initial_value: '1.0'
+  - id: max_brightness
+    type: float
+    restore_value: true
+    initial_value: '0.85'
   # Most recent raw lux from the BH1750. Updated on every sample (pre-filter)
   # so auto-brightness and the bias slider can react immediately without
   # waiting for the throttled, smoothed published value.
@@ -270,26 +386,21 @@ switch:
     icon: "mdi:brightness-auto"
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
+    # The script reads the switch state directly, so no global mirror is
+    # needed. On turn_on we kick the script so it applies the current
+    # lux immediately (guarded: no-op if the light is off).
     turn_on_action:
-      - globals.set:
-          id: auto_brightness
-          value: 'true'
-      # Apply immediately using the cached last_lux instead of waiting for
-      # the next (filtered, throttled) sensor publish.
       - script.execute: apply_auto_brightness
-    turn_off_action:
-      - globals.set:
-          id: auto_brightness
-          value: 'false'
 
 number:
+  # Both sliders store their state in the matching global (see globals:
+  # block). The on_value handler writes through to the global, and on_boot
+  # pushes the restored global back into the entity.
   - platform: template
     name: "Brightness Bias"
     id: brightness_bias_number
     icon: "mdi:tune-vertical"
     optimistic: true
-    restore_value: true
-    initial_value: 1.0
     min_value: 0.5
     max_value: 2.0
     step: 0.05
@@ -298,6 +409,25 @@ number:
       then:
         - globals.set:
             id: brightness_bias
+            value: !lambda 'return x;'
+        - script.execute: apply_auto_brightness
+
+  - platform: template
+    name: "Max Brightness"
+    id: max_brightness_number
+    icon: "mdi:car-speed-limiter"
+    optimistic: true
+    min_value: 0.30
+    max_value: 1.00
+    step: 0.05
+    mode: slider
+    # Hard cap applied in the display lambda: if user_brightness exceeds
+    # max, output colors are scaled by (max / user_brightness). Caps auto
+    # and manual brightness alike without dimming below-max settings.
+    on_value:
+      then:
+        - globals.set:
+            id: max_brightness
             value: !lambda 'return x;'
         - script.execute: apply_auto_brightness
 
@@ -346,6 +476,19 @@ light:
     gamma_correct: 1.0
     # Persist the user's chosen color and brightness across reboots.
     restore_mode: RESTORE_DEFAULT_ON
+    # Light effects don't persist across off/on, so HA would otherwise
+    # show a blank strip after toggling off and back on. Auto-select
+    # Clock Display whenever the light comes on with no effect active;
+    # the guard keeps user-selected diagnostic effects (Cap Walk, Digit
+    # Test) intact.
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(clock_leds).get_effect_name() == "None";'
+          then:
+            - light.turn_on:
+                id: clock_leds
+                effect: "Clock Display"
     # ESP32-S3 timing: stream via DMA so Wi-Fi / scheduler interrupts can't
     # cause RMT buffer underruns mid-frame. rmt_symbols is the DMA chunk size
     # in bits; 1024 is the largest the new ESP-IDF RMT TX driver accepts here.
@@ -435,6 +578,10 @@ light:
       # display. Coloring depends on the active Clock Mode (see select).
       - addressable_lambda:
           name: "Clock Display"
+          # 50 ms = 20 fps. Smooth enough that the Waves mode's 1.2 s
+          # sinusoid and the colon fade look continuous. use_dma: true +
+          # rmt_symbols: 1024 (see below) give the RMT pipeline enough
+          # headroom that Wi-Fi / API interrupts don't disturb the frame.
           update_interval: 50ms
           lambda: |-
             static const uint8_t ROW_COL_TO_CAP[5][3] = {
@@ -490,11 +637,42 @@ light:
               s_minute % 10,
             };
 
-            auto paint_cap = [&](int cap, Color color) {
+            // Sub-pixel dimming: each cap has 3 LEDs and a uint8_t PWM per
+            // channel, so the dimmest "all-3-on" state is (1,1,1) across
+            // the cap. Below that we can still represent 2 useful steps
+            // by lighting only 1 or 2 of the 3 LEDs. FC carries the
+            // intended per-LED colour as floats so values below 1 survive
+            // until paint_cap decides how to distribute them.
+            struct FC { float r, g, b; };
+            auto paint_cap = [&](int cap, FC c) {
               int base = cap * LEDS_PER_CAP;
-              it[base + 0] = color;
-              it[base + 1] = color;
-              it[base + 2] = color;
+              Color off_c(0, 0, 0);
+              float max_c = fmaxf(c.r, fmaxf(c.g, c.b));
+              int n;
+              float scale;
+              if (max_c < 0.167f) {
+                // Below half a sub-pixel step -- round to fully off.
+                n = 0;
+                scale = 0.0f;
+              } else if (max_c >= 1.0f) {
+                // Normal path: trust the colour, paint all 3 LEDs.
+                n = LEDS_PER_CAP;
+                scale = 1.0f;
+              } else {
+                // Sub-pixel: total cap output ~= max_c * LEDS_PER_CAP in
+                // LED-channel units. Round to an integer LED count and
+                // scale so the max channel hits the 1/255 floor exactly.
+                n = (int)roundf(max_c * (float)LEDS_PER_CAP);
+                if (n < 1) n = 1;
+                if (n > LEDS_PER_CAP) n = LEDS_PER_CAP;
+                scale = 1.0f / max_c;
+              }
+              Color on_c((uint8_t)fminf(255.0f, c.r * scale),
+                         (uint8_t)fminf(255.0f, c.g * scale),
+                         (uint8_t)fminf(255.0f, c.b * scale));
+              for (int i = 0; i < LEDS_PER_CAP; i++) {
+                it[base + i] = (i < n) ? on_c : off_c;
+              }
             };
 
             int mode = id(clock_mode);
@@ -505,7 +683,31 @@ light:
             float user_brightness =
                 id(clock_leds).current_values.get_brightness();
 
-            auto hsv_to_color = [](float h, float s, float v) -> Color {
+            // Hard max-brightness cap. If the user's setting is above the
+            // cap, scale all emitted colors by (max / user). If it's at or
+            // below, do nothing -- it's a cap, not a global dim.
+            //   non_rainbow_scale: multiplies colors derived from
+            //     current_color (which already has user_brightness baked
+            //     in), so only the excess is trimmed.
+            //   eff_brightness: the effective brightness to use where we
+            //     drive brightness directly (rainbow).
+            // Safety: if max_brightness is out of the slider's range
+            // (e.g. a corrupted preference came back as 0), fall back to
+            // the safe default instead of blanking the display or lifting
+            // the cap entirely. on_boot also clamps to this same value.
+            float max_b = id(max_brightness);
+            if (max_b < 0.3f || max_b > 1.0f) max_b = 0.85f;
+            float eff_brightness = user_brightness < max_b ? user_brightness
+                                                           : max_b;
+            float non_rainbow_scale = 1.0f;
+            if (user_brightness > 0.001f && user_brightness > max_b) {
+              non_rainbow_scale = max_b / user_brightness;
+            }
+
+            // HSV->RGB that keeps values as floats in 0..255. Letting
+            // paint_cap do the final cast preserves sub-1 channel values
+            // for the sub-pixel dimming path.
+            auto hsv_to_fc = [](float h, float s, float v) -> FC {
               h = h - floorf(h);
               float r = 0, g = 0, b = 0;
               int i = (int)(h * 6.0f);
@@ -521,41 +723,43 @@ light:
                 case 4: r = u; g = p; b = v; break;
                 case 5: r = v; g = p; b = q; break;
               }
-              return Color((uint8_t)(r * 255.0f),
-                           (uint8_t)(g * 255.0f),
-                           (uint8_t)(b * 255.0f));
+              return FC{r * 255.0f, g * 255.0f, b * 255.0f};
             };
 
-            auto scale_color = [](Color c, float k) -> Color {
+            auto scale_fc = [](FC c, float k) -> FC {
               if (k < 0.0f) k = 0.0f;
-              if (k > 1.0f) k = 1.0f;
-              return Color((uint8_t)(c.r * k),
-                           (uint8_t)(c.g * k),
-                           (uint8_t)(c.b * k));
+              return FC{c.r * k, c.g * k, c.b * k};
             };
 
-            // Bicolor secondary = primary with channels rotated R<-G<-B<-R.
-            // Brightness-preserving and visibly distinct from the primary.
-            Color minutes_color = Color(current_color.g,
-                                         current_color.b,
-                                         current_color.r);
+            // The user's chosen colour as floats. current_color already
+            // has user_brightness baked in.
+            FC primary{(float)current_color.r,
+                       (float)current_color.g,
+                       (float)current_color.b};
+            // Bicolor secondary = primary with channels rotated
+            // R<-G<-B<-R. Brightness-preserving and visibly distinct.
+            FC minutes_fc{primary.g, primary.b, primary.r};
 
-            auto color_for = [&](int x, int logical_d) -> Color {
+            auto color_for = [&](int x, int logical_d) -> FC {
               switch (mode) {
                 case 1: { // Rainbow: hue = position + 30s drift
                   float h = ((float)x / DISPLAY_W) - (t_ms / 30000.0f);
-                  return scale_color(hsv_to_color(h, 1.0f, 1.0f),
-                                     user_brightness);
+                  return scale_fc(hsv_to_fc(h, 1.0f, 1.0f),
+                                  eff_brightness);
                 }
                 case 2: { // Bicolor: hours = primary, minutes = rotated.
                   // Colon (logical_d == -1) alternates each blink so the
                   // dots cycle between the two colors over time.
+                  FC base;
                   if (logical_d == -1) {
                     int blink = (int)(t_ms / 2000.0f);
-                    return (blink & 1) ? minutes_color : current_color;
+                    base = (blink & 1) ? minutes_fc : primary;
+                  } else if (logical_d == 2 || logical_d == 3) {
+                    base = minutes_fc;
+                  } else {
+                    base = primary;
                   }
-                  if (logical_d == 2 || logical_d == 3) return minutes_color;
-                  return current_color;
+                  return scale_fc(base, non_rainbow_scale);
                 }
                 case 3: { // Waves: visible brightness sweep + gentle hue drift.
                   // Brightness floor is 0.5 so digits with few lit caps
@@ -568,19 +772,14 @@ light:
                   // stays anchored to the chosen color.
                   float c = 0.10f + 0.10f * sinf((float)x * 0.4f -
                                                  t_ms / 2500.0f);
-                  Color alt = Color(current_color.b,
-                                    current_color.r,
-                                    current_color.g);
-                  uint8_t r = (uint8_t)(current_color.r * (1.0f - c) +
-                                        alt.r * c);
-                  uint8_t g = (uint8_t)(current_color.g * (1.0f - c) +
-                                        alt.g * c);
-                  uint8_t b = (uint8_t)(current_color.b * (1.0f - c) +
-                                        alt.b * c);
-                  return scale_color(Color(r, g, b), w);
+                  FC alt{primary.b, primary.r, primary.g};
+                  FC mixed{primary.r * (1.0f - c) + alt.r * c,
+                           primary.g * (1.0f - c) + alt.g * c,
+                           primary.b * (1.0f - c) + alt.b * c};
+                  return scale_fc(mixed, w * non_rainbow_scale);
                 }
                 default:  // Mono
-                  return current_color;
+                  return scale_fc(primary, non_rainbow_scale);
               }
             };
 
@@ -609,7 +808,7 @@ light:
             // (2 s period) cosine fade in the active mode's color.
             float phase = (millis() % 2000) / 2000.0f;
             float fade = 0.5f * (1.0f - cosf(phase * 2.0f * 3.14159265f));
-            Color colon_base = color_for(COLON_X, -1);
-            Color colon_color = scale_color(colon_base, fade);
+            FC colon_base = color_for(COLON_X, -1);
+            FC colon_color = scale_fc(colon_base, fade);
             paint_cap(COLON_OFFSET + 1, colon_color);
             paint_cap(COLON_OFFSET + 3, colon_color);

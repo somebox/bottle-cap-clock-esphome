@@ -1,1 +1,9 @@
-esphome>=2024.1.0
+esphome==2026.2.4
+# Required by the pioarduino platform-espressif32 (>=55.03.37) builder when
+# running under an external venv (e.g. `venv/bin/esphome run ...`).
+# Without these the build fails with:
+#   ModuleNotFoundError: No module named 'littlefs'
+#   ModuleNotFoundError: No module named 'fatfs'
+# The `fatfs-ng` package provides the `fatfs` module that the builder imports.
+littlefs-python>=0.17.0
+fatfs-ng>=0.1.15
