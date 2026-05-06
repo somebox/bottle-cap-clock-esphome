@@ -61,14 +61,17 @@ All user-facing settings live in the web UI (and mirror to Home Assistant):
 
 | Entity | Type | Description |
 |--------|------|-------------|
-| Clock LEDs | light | Master on/off, color, brightness. Color is also used as the base color for all clock modes. |
+| Clock LEDs | light | Master on/off and color. Color is also used as the base color for all clock modes. The brightness slider is intentionally pinned at 100% (see "Why the brightness slider snaps back" below); use Brightness Offset and Max Brightness for level control. |
 | Clock Mode | select | `Mono`, `Rainbow`, `Bicolor`, `Waves`. Persists across reboots. |
 | Rotate 180 | switch | Flips the display for upside-down mounting. |
 | Auto Brightness | switch | Drives brightness from the BH1750 lux reading. |
-| Brightness Bias | number | Make-up gain on the auto-brightness curve (0.5..3.0). Doubles brightness across the whole curve when doubled. |
-| Saturation Lux | number | Lux at which the curve reaches max brightness (50..2000). Lower = clock saturates earlier; higher = stretched response for bright rooms. |
+| Dim Lux | number | Top of the dark band (0.5..50). At or below this lux the clock sits at B=1/2/3 (1, 2, or 3 LEDs per cap at PWM 1). |
+| Bright Lux | number | Lux at which the curve reaches max brightness (50..2000). |
+| Brightness Offset | number | Trim of the lit ramp in stops (-2..+2 EV). Does not affect the dark band. |
 | Max Brightness | number | Hard cap on the light output (0.30..1.00). Applies to manual and auto control. |
-| Ambient Light | sensor | Raw lux reading from the BH1750. |
+| Ambient Light | sensor | Lux reading from the BH1750. Sampled at 1 Hz locally; published to HA every 30 s (median + throttle). |
+| Clock Brightness | sensor | The display's current brightness on a 0..255 scale. Updated locally on every auto-brightness sample (1 Hz); published to HA every 30 s. |
+| Clock FPS | sensor | Diagnostic. Frame rate of the Clock Display effect, sampled every 5 s. Reads 0 in the Cap Walk / Digit Test diagnostic effects. |
 | User Button | binary_sensor | The button on the back of the board. Not bound to anything by default. |
 
 For deeper changes (timezone, GPIO assignments, project name) edit the
@@ -76,31 +79,44 @@ For deeper changes (timezone, GPIO assignments, project name) edit the
 
 ### Auto-brightness curve
 
-When **Auto Brightness** is on, the firmware maps lux from the BH1750 into the
-clock's 0..255 brightness on a smooth curve. Two orthogonal controls shape it:
+When **Auto Brightness** is on, the firmware feeds raw BH1750 samples (1 s
+cadence) into a 10 s exponential filter and maps the smoothed lux through a
+**three-region curve** to the clock's 0..255 brightness. Each region has a
+specific job and the four knobs each answer one question:
 
-- **Saturation Lux** sets the curve's horizontal scale: it is the lux value
-  at which the curve reaches max brightness. Lower values compress the curve
-  so the clock saturates earlier (good for permanently dim rooms); higher
-  values stretch it (good for sunlit rooms where you want headroom). Above
-  Saturation Lux the output stays flat — there is no overshoot.
-- **Brightness Bias** is **uniform make-up gain**. It scales the curve up or
-  down without changing where it saturates. Doubling the bias roughly doubles
-  the brightness at every lux level (until clamped by Max Brightness). It does
-  *not* lift the dark-room floor: a pitch-dark room always lands at B=1 (one
-  tiny dot per cap) regardless of bias.
+- **Dark band** — `lux ∈ [0, dim_lux]`. The clock sits at one of B=1/2/3
+  (1, 2, or 3 LEDs per cap at PWM 1), chosen log-wise across the band so
+  each value gets a meaningful slice of the room's truly-dim time. This
+  region is **invariant** to Brightness Offset — a truly dark room never
+  glows brighter just because you nudged the daytime trim.
+- **Lit ramp** — `lux ∈ [dim_lux, bright_lux]`. Brightness goes from B=3
+  to B=255, **linear in `log(lux)`**, so each doubling of room light is
+  roughly the same brightness step.
+- **Saturated** — `lux ≥ bright_lux`. B=255, then capped by Max Brightness.
+
+The four knobs:
+
+- **Dim Lux** (default 5) — top of the dark band. Raise so dim rooms still
+  get all 3 LEDs lit before the climb starts; lower so the climb starts
+  sooner.
+- **Bright Lux** (default 200) — lux at which the lit ramp hits max. Raise
+  for sunlit rooms with daytime headroom; lower so cloudy daytime hits
+  full. For a window-lit living room ~300 is a good starting point.
+- **Brightness Offset** (default 0 EV) — pure trim of the lit ramp in
+  stops. +1 doubles the curve everywhere on the lit ramp; -1 halves it.
+  Use this for "make it a touch brighter overall" without retuning the
+  anchors.
+- **Max Brightness** (default 0.85) — hard ceiling, applies to manual and
+  auto alike.
 
 ![Auto-brightness curve](doc/auto-brightness-curve.svg)
 
-The left panel shows how Brightness Bias scales the whole curve up and down
-without moving its saturation point. The right panel shows how Saturation
-Lux changes where the curve reaches max brightness: lower values pull the
-"knee" inward, higher values push it out. Tune the response with the two
-sliders rather than editing the lambda.
+The left panel shows how moving Dim Lux / Bright Lux widens or shifts the
+curve. The right panel shows that Brightness Offset only trims the lit
+ramp — the dark-band staircase at the bottom-left stays put.
 
-The curve is gentle at the dim end on purpose. Below ~10 lux only one or two
-LEDs per cap are lit, walking through the *sub-pixel ladder* the firmware
-exposes:
+The dim-end ladder is what makes B=1/2/3 distinguishable: below ~5 lux only
+one or two LEDs per cap are lit, walking through a *sub-pixel ladder*:
 
 | HA brightness `B` | Per-cap output |
 |---|---|
@@ -113,9 +129,48 @@ exposes:
 This extends the dim end of the WS2812's PWM range by three sub-steps that
 would otherwise be unreachable.
 
-The Python tests in `tests/test_brightness_mapping.py` mirror this math and
-verify the curve, the saturation point, the make-up-gain property of bias,
-and the sub-pixel ladder. Re-run them after curve changes:
+#### Tuning workflow
+
+The Clock Brightness sensor records the light's current 0..255 value to HA
+history, so the recommended workflow is:
+
+1. Leave defaults for a day or two.
+2. Open the Clock Brightness graph next to Ambient Light in HA.
+3. Adjust:
+   - Evenings looking too dim → raise **Dim Lux** (e.g. 5 → 8).
+   - Cloudy daytime too dim → lower **Bright Lux** (e.g. 200 → 150).
+   - Sunny noon clipping → raise **Bright Lux** (e.g. 200 → 350).
+   - Whole curve a touch off → nudge **Brightness Offset** by ±0.25 EV.
+4. The truly-dark behaviour is set by construction; no knob can make a
+   pitch-dark room glow.
+
+Sensor placement matters: a recessed or diffused sensor compresses peaks,
+which is generally helpful — just re-set Bright Lux to match the new range.
+
+#### Why the brightness slider snaps back
+
+The Clock LEDs entity exposes a brightness slider in HA, but it's held at
+100% by the firmware. This is deliberate. ESPHome's `addressable_light`
+framework bakes the light's current brightness into the per-pixel colour
+correction (`local_brightness` in `ESPColorCorrection`), so writing a
+sub-pixel value of `Color(1,1,1)` while the light is at brightness 1/255
+gets multiplied a second time and rounds to PWM 0 via `scale8_twice`. The
+dark-band floor (B=1/2/3 = 1/2/3 LEDs at PWM 1) becomes invisible.
+
+To preserve the floor, the firmware does all dimming itself in the
+display lambda via a `display_b` global, and pins the framework
+brightness at 100% so the colour correction is a no-op. The auto-
+brightness curve writes `display_b`; the Clock Brightness sensor reads
+it; the HA brightness slider is bypassed and bounces back to 100% if
+moved. Brightness Offset and Max Brightness are the levers for level
+control.
+
+#### Tests and tools
+
+The Python tests in `tests/test_brightness_mapping.py` mirror the curve and
+verify each contract (dark band only B=1/2/3, lit ramp linear in log(lux),
+offset doesn't lift the dark band, monotonicity, max-cap, sub-pixel ladder).
+Re-run them after curve changes:
 
 ```bash
 python3 tests/test_brightness_mapping.py
@@ -125,6 +180,14 @@ To regenerate the chart after editing constants:
 
 ```bash
 python3 tools/plot_brightness_curve.py
+```
+
+To validate a candidate curve against a CSV of real device history exported
+from HA (columns: `timestamp,entity,value`, with `entity=ambient_light_lux`
+rows):
+
+```bash
+python3 tools/validate_curves.py /path/to/data.csv
 ```
 
 ### Local development with hardcoded Wi-Fi
@@ -189,6 +252,7 @@ doc/                             Documentation, diagrams, photos
   auto-brightness-curve.svg      Reference chart for the lux curve
 tests/test_brightness_mapping.py Verifies the brightness math
 tools/plot_brightness_curve.py   Regenerates the SVG chart
+tools/validate_curves.py         Replays a HA CSV through the curve
 secrets.yaml.example             Optional Wi-Fi credentials template
 setup.sh                         Creates venv/ and installs esphome
 requirements.txt                 Python dependencies (esphome only)
@@ -224,7 +288,7 @@ PRs welcome. Things that would be useful:
 
 - Per-minute / per-hour transition animations (plasma wipe, sparkle, etc.)
 - Optional 12 h format and AM/PM indicator
-- Auto-brightness curve presets (linear, perceptual, night-only)
+- Auto-brightness curve presets (e.g. quick "bedroom" / "kitchen" / "office" defaults that snap Dim Lux / Bright Lux to common rooms)
 - Schematic and PCB files for the carrier board
 
 See also `doc/esphome-led-best-practices.md` for the design notes and

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Generate an SVG plot of the auto-brightness curve.
+Generate an SVG plot of the three-region auto-brightness curve.
 
-Two panels:
-  Left:  Brightness Bias as make-up gain (sat_lux fixed at 250).
-         Several bias values overlaid on the same axes.
-  Right: Saturation Lux as the curve's reference / saturation
-         point (bias = 1.0). Lower sat compresses the lux range
-         so the clock saturates earlier; higher sat stretches it.
+Two panels, both on a log-x lux axis:
+  Left:  Dim Lux / Bright Lux variations at offset = 0.
+         Shows how moving the two anchors widens or shifts the curve.
+  Right: Brightness Offset variations at default anchors.
+         Shows that the dark band (lux <= dim_lux) is invariant to the
+         offset, while the lit ramp shifts in stops.
 
 The curve math mirrors apply_auto_brightness in clock.yaml. If you
 change the curve in the YAML, re-run this script to refresh the
@@ -18,25 +18,48 @@ plot:
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
+
 
 # ---------------------------------------------------------------------------
 # Curve (mirrors clock.yaml's apply_auto_brightness lambda)
 # ---------------------------------------------------------------------------
 
-FLOOR = 1.0 / 255.0
-CURVE_P = 1.5
+FLOOR_B = 1.0 / 255.0
+B3      = 3.0 / 255.0
+EPS     = 1e-3
 
 
-def target(lux: float, bias: float = 1.0, sat_lux: float = 250.0,
-           max_b: float = 1.0) -> float:
+def target(lux: float, dim_lux: float = 5.0, bright_lux: float = 200.0,
+           offset_stops: float = 0.0, max_b: float = 1.0) -> float:
     if lux < 0.0:
         lux = 0.0
-    sat = max(sat_lux, 1.0)
-    ratio = min(lux / sat, 1.0)
-    lit_bonus = (ratio ** CURVE_P) * (1.0 - FLOOR)
-    t = FLOOR + lit_bonus * bias
-    return min(t, max_b)
+    if dim_lux < 0.5:
+        dim_lux = 0.5
+    if bright_lux <= dim_lux:
+        bright_lux = dim_lux + 1.0
+
+    if lux <= dim_lux:
+        night = dim_lux / 10.0
+        lo = math.log(night + EPS)
+        hi = math.log(dim_lux + EPS)
+        t = (math.log(lux + EPS) - lo) / (hi - lo)
+        t = max(0.0, min(1.0, t))
+        step = min(2, int(t * 3.0))
+        return min(max_b, (1.0 + step) / 255.0)
+
+    if lux >= bright_lux:
+        t = 1.0
+    else:
+        t = (math.log(lux) - math.log(dim_lux)) / (
+            math.log(bright_lux) - math.log(dim_lux)
+        )
+    out = B3 + t * (1.0 - B3)
+    out *= 2.0 ** offset_stops
+    if out < B3:
+        out = B3
+    return min(max_b, out)
 
 
 def to_brightness_pct(t: float) -> float:
@@ -47,36 +70,36 @@ def to_brightness_pct(t: float) -> float:
 # SVG plotting helpers (no external deps)
 # ---------------------------------------------------------------------------
 
-PANEL_W = 420
-PANEL_H = 280
-MARGIN = {"l": 50, "r": 20, "t": 40, "b": 50}
+PANEL_W = 460
+PANEL_H = 300
+MARGIN = {"l": 56, "r": 24, "t": 44, "b": 56}
 GAP = 50
 
 PLOT_W = PANEL_W - MARGIN["l"] - MARGIN["r"]
 PLOT_H = PANEL_H - MARGIN["t"] - MARGIN["b"]
 
-LUX_MAX = 500.0
+LUX_MIN = 0.1
+LUX_MAX = 1500.0
 B_MAX = 100.0
 
-# Categorical palette for the bias panel (distinct hues).
-PALETTE_CAT = ["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728", "#000000"]
-
-# Sequential palette for the sat panel (curves have a natural
-# ordering by sat_lux). Goes from dim/cool to bright/warm so the
-# eye can read "smaller sat" -> "leftmost / coolest curve".
 PALETTE_SEQ = ["#08306b", "#2171b5", "#41ab5d", "#fb6a4a", "#cb181d"]
 
 
 def x(lux: float, panel_x_offset: int) -> float:
-    return panel_x_offset + MARGIN["l"] + (lux / LUX_MAX) * PLOT_W
+    """Log-scale x axis: log(LUX_MIN) maps to plot left, log(LUX_MAX) to right."""
+    if lux < LUX_MIN:
+        lux = LUX_MIN
+    t = (math.log(lux) - math.log(LUX_MIN)) / (math.log(LUX_MAX) - math.log(LUX_MIN))
+    return panel_x_offset + MARGIN["l"] + t * PLOT_W
 
 
 def y(b_pct: float) -> float:
     return MARGIN["t"] + (1 - b_pct / B_MAX) * PLOT_H
 
 
-def axis_x_ticks() -> list[float]:
-    return [0, 100, 200, 300, 400, 500]
+# Decade ticks: 0.1, 1, 10, 100, 1000
+def axis_x_ticks() -> list[tuple[float, str]]:
+    return [(0.1, "0.1"), (1, "1"), (10, "10"), (100, "100"), (1000, "1000")]
 
 
 def axis_y_ticks() -> list[float]:
@@ -93,8 +116,8 @@ def panel(panel_x_offset: int, title: str, curves: list[dict],
         f'stroke="#ddd" stroke-width="1" />'
     )
 
-    for tx in axis_x_ticks():
-        sx = x(tx, panel_x_offset)
+    for tx_lux, label in axis_x_ticks():
+        sx = x(tx_lux, panel_x_offset)
         parts.append(
             f'<line x1="{sx}" y1="{MARGIN["t"]}" '
             f'x2="{sx}" y2="{MARGIN["t"] + PLOT_H}" '
@@ -103,7 +126,7 @@ def panel(panel_x_offset: int, title: str, curves: list[dict],
         parts.append(
             f'<text x="{sx}" y="{MARGIN["t"] + PLOT_H + 18}" '
             f'font-size="11" font-family="sans-serif" text-anchor="middle" '
-            f'fill="#555">{int(tx)}</text>'
+            f'fill="#555">{label}</text>'
         )
 
     for ty in axis_y_ticks():
@@ -121,14 +144,14 @@ def panel(panel_x_offset: int, title: str, curves: list[dict],
 
     parts.append(
         f'<text x="{panel_x_offset + MARGIN["l"] + PLOT_W / 2}" '
-        f'y="{MARGIN["t"] - 14}" font-size="13" font-family="sans-serif" '
+        f'y="{MARGIN["t"] - 16}" font-size="13" font-family="sans-serif" '
         f'font-weight="600" text-anchor="middle" fill="#222">{title}</text>'
     )
     parts.append(
         f'<text x="{panel_x_offset + MARGIN["l"] + PLOT_W / 2}" '
-        f'y="{MARGIN["t"] + PLOT_H + 38}" font-size="11" '
+        f'y="{MARGIN["t"] + PLOT_H + 40}" font-size="11" '
         f'font-family="sans-serif" text-anchor="middle" fill="#444">'
-        f'Ambient lux</text>'
+        f'Ambient lux (log scale)</text>'
     )
     parts.append(
         f'<text transform="rotate(-90 {panel_x_offset + 14} '
@@ -138,16 +161,26 @@ def panel(panel_x_offset: int, title: str, curves: list[dict],
         f'Brightness (% of 255)</text>'
     )
 
-    legend_x = panel_x_offset + MARGIN["l"] + PLOT_W - 130
+    legend_x = panel_x_offset + MARGIN["l"] + 8
     legend_y = MARGIN["t"] + 10
+
+    # Sample log-uniformly across LUX_MIN..LUX_MAX so the staircase in
+    # the dark band shows up cleanly without aliasing.
+    n_samples = 1200
+    lux_samples = [
+        LUX_MIN * (LUX_MAX / LUX_MIN) ** (i / (n_samples - 1))
+        for i in range(n_samples)
+    ]
 
     for i, curve in enumerate(curves):
         color = palette[i % len(palette)]
-        bias = curve.get("bias", 1.0)
-        sat = curve.get("sat", 250.0)
-        lux_samples = [j * (LUX_MAX / 500.0) for j in range(501)]
+        dim_l  = curve.get("dim_lux",    5.0)
+        brt_l  = curve.get("bright_lux", 200.0)
+        offset = curve.get("offset",     0.0)
+
         pts = [
-            (x(lx, panel_x_offset), y(to_brightness_pct(target(lx, bias, sat))))
+            (x(lx, panel_x_offset),
+             y(to_brightness_pct(target(lx, dim_l, brt_l, offset))))
             for lx in lux_samples
         ]
         d = "M " + " L ".join(f"{px:.1f},{py:.1f}" for px, py in pts)
@@ -173,25 +206,27 @@ def generate_svg() -> str:
     total_w = PANEL_W * 2 + GAP
     total_h = PANEL_H + 30
 
+    # Left: vary the two lux anchors, offset = 0.
     left_curves = [
-        {"label": "bias 0.5",           "bias": 0.5, "sat": 250.0},
-        {"label": "bias 1.0 (default)", "bias": 1.0, "sat": 250.0},
-        {"label": "bias 1.5",           "bias": 1.5, "sat": 250.0},
-        {"label": "bias 2.0",           "bias": 2.0, "sat": 250.0},
-        {"label": "bias 3.0",           "bias": 3.0, "sat": 250.0},
+        {"label": "dim 2  / bright 100",            "dim_lux": 2.0,  "bright_lux": 100.0},
+        {"label": "dim 5  / bright 200 (default)",  "dim_lux": 5.0,  "bright_lux": 200.0},
+        {"label": "dim 5  / bright 300",            "dim_lux": 5.0,  "bright_lux": 300.0},
+        {"label": "dim 10 / bright 500",            "dim_lux": 10.0, "bright_lux": 500.0},
+        {"label": "dim 20 / bright 1000",           "dim_lux": 20.0, "bright_lux": 1000.0},
     ]
+    # Right: vary brightness offset at default anchors.
     right_curves = [
-        {"label": "sat 100", "bias": 1.0, "sat": 100.0},
-        {"label": "sat 200", "bias": 1.0, "sat": 200.0},
-        {"label": "sat 300", "bias": 1.0, "sat": 300.0},
-        {"label": "sat 500", "bias": 1.0, "sat": 500.0},
-        {"label": "sat 1000","bias": 1.0, "sat": 1000.0},
+        {"label": "offset -1 EV", "offset": -1.0},
+        {"label": "offset -0.5",  "offset": -0.5},
+        {"label": "offset 0 (default)", "offset": 0.0},
+        {"label": "offset +0.5",  "offset": +0.5},
+        {"label": "offset +1 EV", "offset": +1.0},
     ]
 
     body = []
-    body.append(panel(0, "Brightness Bias (sat_lux = 250)",
-                      left_curves, PALETTE_CAT))
-    body.append(panel(PANEL_W + GAP, "Saturation Lux (bias = 1.0)",
+    body.append(panel(0, "Dim Lux / Bright Lux (offset = 0)",
+                      left_curves, PALETTE_SEQ))
+    body.append(panel(PANEL_W + GAP, "Brightness Offset (dim=5, bright=200)",
                       right_curves, PALETTE_SEQ))
 
     return (

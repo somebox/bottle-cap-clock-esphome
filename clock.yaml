@@ -21,7 +21,7 @@ substitutions:
   friendly_name: "Bottle Cap Clock"
   # Project version - bump on every release so OTA updates show up correctly
   # in the ESPHome dashboard / Home Assistant.
-  project_version: "1.2.2"
+  project_version: "1.3.0"
   # IANA tz database name. See:
   # https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
   timezone: "Europe/Berlin"
@@ -61,37 +61,52 @@ esphome:
       - output.turn_off: heartbeat_led
       # Force the clock effect on boot so the strip doesn't get stuck on a
       # diagnostic effect (Cap Walk / Digit Test) from a previous session.
-      # Color and brightness come from the light's restored state.
+      # Brightness is intentionally pinned at 100% here: the addressable
+      # light framework would otherwise multiply the framebuffer by the
+      # light's brightness via local_brightness in ESPColorCorrection,
+      # crushing our sub-pixel-ladder output (B=1/2/3) to PWM 0. We
+      # apply our own dimming in the display lambda instead, sourcing
+      # the level from the display_b global.
       - light.turn_on:
           id: clock_leds
           effect: "Clock Display"
+      - light.turn_on:
+          id: clock_leds
+          brightness: 100%
+          transition_length: 0s
       # Defensive clamp: on first boot after a firmware upgrade the
       # preferences slot for a newly-added global can come back as 0.0
       # instead of initial_value. Clamp to the entity's valid range
       # before we sync the number entities below.
       - lambda: |-
-          if (id(brightness_bias) < 0.5f || id(brightness_bias) > 3.0f) {
-            id(brightness_bias) = 1.0f;
+          if (id(dim_lux) < 0.5f || id(dim_lux) > 50.0f) {
+            id(dim_lux) = 5.0f;
+          }
+          if (id(bright_lux) < 50.0f || id(bright_lux) > 2000.0f) {
+            id(bright_lux) = 200.0f;
+          }
+          if (id(brightness_offset) < -2.0f || id(brightness_offset) > 2.0f) {
+            id(brightness_offset) = 0.0f;
           }
           if (id(max_brightness) < 0.3f || id(max_brightness) > 1.0f) {
             id(max_brightness) = 0.85f;
-          }
-          if (id(saturation_lux) < 50.0f || id(saturation_lux) > 2000.0f) {
-            id(saturation_lux) = 250.0f;
           }
       # Sync the user-facing number entities from their backing globals.
       # The globals own persistence (reliable across reboots/OTAs); the
       # entities are initialised from them here so HA sees the correct
       # value immediately on connect.
       - number.set:
-          id: brightness_bias_number
-          value: !lambda 'return id(brightness_bias);'
+          id: dim_lux_number
+          value: !lambda 'return id(dim_lux);'
+      - number.set:
+          id: bright_lux_number
+          value: !lambda 'return id(bright_lux);'
+      - number.set:
+          id: brightness_offset_number
+          value: !lambda 'return id(brightness_offset);'
       - number.set:
           id: max_brightness_number
           value: !lambda 'return id(max_brightness);'
-      - number.set:
-          id: saturation_lux_number
-          value: !lambda 'return id(saturation_lux);'
       # Wait a few seconds so the API/HA connection has had time to come up,
       # then announce why the previous run ended. We log at WARN level (so it
       # shows up in `esphome logs` even without HA) and publish to the
@@ -245,10 +260,13 @@ text_sensor:
     entity_category: diagnostic
     update_interval: never
 
-# BH1750 ambient light sensor. When "Auto Brightness" is on, on_value drives
-# the clock brightness from a log-lux curve scaled by "Brightness Bias". A
-# 3-sample median filter rejects single-sample spikes (passing shadows, brief
-# reflections) without slowing the response.
+# BH1750 ambient light sensor. When "Auto Brightness" is on, raw 1 Hz
+# samples feed a 10 s exponential filter (last_lux global), and that
+# smoothed value drives a three-region curve (see apply_auto_brightness):
+# a log-quantised dark band that walks B=1/2/3 below "Dim Lux", a
+# log-linear lit ramp up to "Bright Lux", and a hard ceiling at
+# "Max Brightness". The published Ambient Light entity uses an
+# independent median + 30 s throttle so HA history stays clean.
 sensor:
   - platform: wifi_signal
     name: "WiFi Signal"
@@ -274,32 +292,103 @@ sensor:
     accuracy_decimals: 0
     icon: "mdi:memory"
     entity_category: diagnostic
+  # Display frame rate. Incremented inside the Clock Display effect
+  # lambda (see fps_counter global). The Cap Walk / Digit Test
+  # diagnostic effects do not increment, so this reads 0 in those
+  # modes -- which is what you want, the meaningful FPS number is
+  # for normal display.
+  - platform: template
+    name: "Clock FPS"
+    id: clock_fps_sensor
+    icon: "mdi:speedometer"
+    unit_of_measurement: "fps"
+    accuracy_decimals: 1
+    update_interval: 5s
+    entity_category: diagnostic
+    lambda: |-
+      static uint32_t s_last_ms = 0;
+      uint32_t now = millis();
+      uint32_t count = id(fps_counter);
+      id(fps_counter) = 0;
+      if (s_last_ms == 0) {
+        s_last_ms = now;
+        return NAN;
+      }
+      uint32_t dt = now - s_last_ms;
+      s_last_ms = now;
+      if (dt == 0) return 0.0f;
+      return (float) count * 1000.0f / (float) dt;
   - platform: bh1750
     name: "Ambient Light"
     id: ambient_light
     address: 0x23
-    # Sample every 10 s, smooth across the last minute, and only publish a
-    # new value every 30 s. Keeps auto-brightness reactions gentle and stops
-    # the Ambient Light entity / Home Assistant history from churning on
-    # every tiny lux fluctuation.
-    update_interval: 10s
+    # Sample at 1 Hz (the BH1750's H-resolution measurement is ~120 ms,
+    # so 1 s is comfortable). The 1 Hz rate is for our LOCAL pipeline:
+    # auto-brightness reacts within a couple of seconds. The PUBLISHED
+    # entity is decimated below to ~30 s so HA history stays clean.
+    update_interval: 1s
     filters:
+      # Median + throttle here only affects the value pushed to the API
+      # / HA recorder. on_raw_value below feeds the local EMA from the
+      # raw 1 Hz samples directly.
       - median:
-          window_size: 6
-          send_every: 6
+          window_size: 10
+          send_every: 30
           send_first_at: 1
       - throttle: 30s
-    # Pre-filter: cache the latest lux and apply auto-brightness on every
-    # raw sample so reactions don't wait on the throttle/median used for
-    # the published Ambient Light entity.
+    # Pre-filter: feed every raw 1 Hz sample into a single-pole
+    # exponential filter so auto-brightness tracks sustained ambient
+    # and ignores transient shadows / brief reflections.
+    #
+    #   alpha = 1 - exp(-dt / tau);  dt = 1 s, tau = 10 s
+    #
+    # That settles to ~95 % of a step change in ~30 s, which feels
+    # immediate for things like flipping room lights on, while still
+    # filtering out a person walking past the sensor.
     on_raw_value:
       then:
-        - lambda: 'id(last_lux) = x;'
+        - lambda: |-
+            const float TAU_S = 10.0f;
+            const float DT_S  = 1.0f;
+            const float alpha = 1.0f - expf(-DT_S / TAU_S);
+            if (id(last_lux) < 0.0f) {
+              id(last_lux) = x;
+            } else {
+              id(last_lux) += alpha * (x - id(last_lux));
+            }
         - script.execute: apply_auto_brightness
 
-# Recomputes clock brightness from the cached last_lux + brightness_bias,
-# capped by max_brightness. Called whenever a fresh lux sample arrives,
-# when the bias slider moves, or when auto-brightness is toggled on.
+  # Clock Brightness: numeric sensor that mirrors the light's actual
+  # brightness on the 0..255 scale that HA exposes on light entities.
+  # Recorded by HA so you can plot it against Ambient Light over days
+  # and tune Dim Lux / Bright Lux / Brightness Offset from history.
+  #
+  # Updated two ways:
+  #   - pushed from apply_auto_brightness on every fresh target (no
+  #     aliasing with the polling interval, no transition lag);
+  #   - polled here every 30 s as a heartbeat so manual brightness
+  #     changes from the HA slider still land in the recorder.
+  - platform: template
+    name: "Clock Brightness"
+    id: clock_brightness_sensor
+    icon: "mdi:brightness-percent"
+    accuracy_decimals: 0
+    update_interval: 30s
+    # Local updates run at 1 Hz (synchronous publish from
+    # apply_auto_brightness). The throttle filter below decimates that
+    # to the API / recorder so HA only sees one sample every 30 s --
+    # enough to plot trends, not enough to flood the recorder.
+    filters:
+      - throttle: 30s
+    lambda: |-
+      if (!id(clock_leds).remote_values.is_on()) return 0.0f;
+      return roundf(id(display_b) * 255.0f);
+
+# Recomputes display_b from the smoothed last_lux through the
+# three-region curve (Dim Lux / Bright Lux / Brightness Offset),
+# capped by Max Brightness. Called whenever a fresh lux sample
+# arrives, when any of the auto-brightness sliders move, or when
+# Auto Brightness is toggled on.
 #
 # Guards:
 #   - Auto Brightness switch must be on.
@@ -317,57 +406,104 @@ script:
               - lambda: 'return id(clock_leds).remote_values.is_on();'
           then:
             - lambda: |-
-                // Auto-brightness curve, lux -> HA brightness:
+                // Three-region auto-brightness curve.
                 //
-                //   ratio  = clamp(lux / saturation_lux, 0, 1)
-                //   target = FLOOR + ratio^p * (1 - FLOOR) * bias
+                //   Dark band : lux in [0, dim_lux]
+                //               B walks 1 -> 2 -> 3 (log-quantised).
+                //               Each band is one third of the
+                //               [dim_lux/10, dim_lux] log range, so
+                //               B=1/2/3 each get a meaningful slice
+                //               of the room's truly-dim time. This
+                //               band is INVARIANT to the offset --
+                //               the napping-room floor is sacred.
                 //
-                // Two independent controls:
-                //   * saturation_lux = the lux at which the curve
-                //     reaches max brightness. Sets the horizontal
-                //     scale of the curve: lower sat = clock hits
-                //     full brightness in dimmer rooms; higher sat =
-                //     more headroom for bright rooms. The natural
-                //     ^p slope rolls off smoothly as lux approaches
-                //     sat, so there's no hard-knee artifact at the
-                //     top.
-                //   * brightness_bias = uniform make-up gain.
-                //     Multiplies the lit_bonus across the whole
-                //     curve. Doubling bias doubles the brightness
-                //     at every lux level below the max-brightness
-                //     cap. Useful for compensating for sensor
-                //     placement / room type without touching the
-                //     curve's saturation point.
+                //   Lit ramp  : lux in [dim_lux, bright_lux]
+                //               B = 3..255, linear in log(lux).
+                //               Each doubling of lux is roughly the
+                //               same brightness step.
                 //
-                // FLOOR (B=1 = one LED per cap at PWM 1) is the
-                // dark-room minimum and is never scaled by bias, so
-                // a pitch-dark room always lands at B=1.
+                //   Saturated : lux >= bright_lux
+                //               B = 255, then capped by max_b.
                 //
-                // Examples at sat=250, bias=1.0, max_b=1.0:
-                //   lux=0   -> B=1     lux=1.5 -> B=1
-                //   lux=10  -> B=3     lux=50  -> B=24
-                //   lux=100 -> B=65    lux=200 -> B=183
-                //   lux=250+ -> B=255
-                const float FLOOR = 1.0f / 255.0f;
-                const float CURVE_P = 1.5f;
+                // Knobs:
+                //   * dim_lux   - top of the dark band. Move up so
+                //                 evenings sit higher on the 1/2/3
+                //                 ladder; move down so the climb
+                //                 starts sooner.
+                //   * bright_lux - lux at which the lit ramp hits
+                //                  max. Move up for sunlit rooms
+                //                  with lots of headroom; move down
+                //                  so cloudy daytime hits full.
+                //   * brightness_offset - additive gain in stops on
+                //                         the LIT ramp output only
+                //                         (does not touch the dark
+                //                         band).
+                //   * max_b - hard ceiling (manual + auto).
+                //
+                // Examples at dim=5, bright=200, offset=0, max=1.0:
+                //   lux=0     -> B=1     lux=0.5  -> B=2
+                //   lux=1.6   -> B=3     lux=5    -> B=3
+                //   lux=10    -> B=22    lux=50   -> B=124
+                //   lux=100   -> B=189   lux=200+ -> B=255
+                const float FLOOR_B = 1.0f / 255.0f;   // B=1
+                const float B3      = 3.0f / 255.0f;
+                const float LUX_EPS = 1e-3f;           // EPS collides with xtensa specreg.h
 
                 float lux = id(last_lux);
                 if (lux < 0.0f) lux = 0.0f;
-                float sat = id(saturation_lux);
-                if (sat < 1.0f) sat = 1.0f;
 
-                float ratio = lux / sat;
-                if (ratio > 1.0f) ratio = 1.0f;
-                float lit_bonus =
-                    powf(ratio, CURVE_P) * (1.0f - FLOOR);
+                float dim_l = id(dim_lux);
+                if (dim_l < 0.5f) dim_l = 0.5f;
+                float bright_l = id(bright_lux);
+                if (bright_l <= dim_l) bright_l = dim_l + 1.0f;
 
-                float target = FLOOR + lit_bonus * id(brightness_bias);
+                float target;
+                if (lux <= dim_l) {
+                  // Dark band: log-quantise into B=1, 2, 3 across
+                  // [dim_l/10, dim_l].
+                  float night_l = dim_l / 10.0f;
+                  float lo = logf(night_l + LUX_EPS);
+                  float hi = logf(dim_l   + LUX_EPS);
+                  float t  = (logf(lux + LUX_EPS) - lo) / (hi - lo);
+                  if (t < 0.0f) t = 0.0f;
+                  if (t > 1.0f) t = 1.0f;
+                  int step = (int) (t * 3.0f);
+                  if (step > 2) step = 2;
+                  target = (1.0f + (float) step) / 255.0f;
+                } else {
+                  // Lit ramp: linear in log(lux) from B=3 to B=255.
+                  float t;
+                  if (lux >= bright_l) {
+                    t = 1.0f;
+                  } else {
+                    t = (logf(lux) - logf(dim_l))
+                      / (logf(bright_l) - logf(dim_l));
+                  }
+                  target = B3 + t * (1.0f - B3);
+                  // Brightness Offset: pure trim of the lit ramp
+                  // (doesn't lift the dark band).
+                  target *= powf(2.0f, id(brightness_offset));
+                  if (target < B3) target = B3;
+                }
+
                 float max_b = id(max_brightness);
                 if (target > max_b) target = max_b;
-                auto call = id(clock_leds).turn_on();
-                call.set_brightness(target);
-                call.set_transition_length(2000);
-                call.perform();
+                // Own dimming via display_b. The display lambda reads
+                // this on its 50 ms tick. We do NOT call
+                // set_brightness on the light: that would route our
+                // value through addressable_light's color correction
+                // (local_brightness = max_brightness * brightness),
+                // double-applying the dim and crushing B<=~16 to PWM
+                // 0 via scale8_twice rounding. Instead, the light
+                // stays pinned at 100% (see on_boot / on_turn_on /
+                // brightness-bounce in the light's on_state) and the
+                // framework correction becomes a no-op.
+                id(display_b) = target;
+                // Record the commanded brightness on HA's 0..255
+                // scale so it lands in the recorder synchronously,
+                // not aliased against the 30 s sensor heartbeat.
+                id(clock_brightness_sensor)
+                    ->publish_state(roundf(target * 255.0f));
 
 # Persistent runtime state. The select / switch / number entities below are
 # the user-facing controls; these globals hold the cached values used by the
@@ -385,31 +521,54 @@ globals:
     type: int
     restore_value: false
     initial_value: '0'
-  # brightness_bias and max_brightness OWN their persistence (globals'
+  # The auto-brightness knobs OWN their persistence here (globals'
   # restore_value is reliable across reboots/OTAs). The matching number
   # entities are synced FROM these on boot and write back here on change.
-  - id: brightness_bias
+  #
+  # dim_lux     - top of the dark band (B walks 1->2->3 below this).
+  # bright_lux  - lux at which the lit ramp reaches B=255.
+  # brightness_offset - trim in stops applied to the lit ramp only.
+  # max_brightness - hard ceiling on commanded brightness.
+  - id: dim_lux
     type: float
     restore_value: true
-    initial_value: '1.0'
+    initial_value: '5.0'
+  - id: bright_lux
+    type: float
+    restore_value: true
+    initial_value: '200.0'
+  - id: brightness_offset
+    type: float
+    restore_value: true
+    initial_value: '0.0'
   - id: max_brightness
     type: float
     restore_value: true
     initial_value: '0.85'
-  # Lux at which the auto-brightness curve reaches max (at bias 1.0).
-  # Higher values stretch the curve over brighter rooms; lower values
-  # make the clock saturate sooner so dim rooms still hit max.
-  - id: saturation_lux
-    type: float
-    restore_value: true
-    initial_value: '250.0'
-  # Most recent raw lux from the BH1750. Updated on every sample (pre-filter)
-  # so auto-brightness and the bias slider can react immediately without
-  # waiting for the throttled, smoothed published value.
+  # Smoothed lux for the auto-brightness path. Initialised to a sentinel
+  # so the first BH1750 sample seeds the EMA directly instead of being
+  # dragged from a fake initial value.
   - id: last_lux
     type: float
     restore_value: false
-    initial_value: '50.0'
+    initial_value: '-1.0'
+  # Effective display brightness on a 0..1 scale. The display lambda
+  # uses this directly (B = round(display_b * 255)) instead of reading
+  # current_values.get_brightness(), so the addressable_light
+  # framework's color_correction (which would otherwise multiply our
+  # framebuffer by the light's current brightness, crushing the
+  # B=1/2/3 sub-pixel ladder to PWM 0) is bypassed: we keep the light
+  # itself pinned at 100% brightness and own the dimming here.
+  - id: display_b
+    type: float
+    restore_value: false
+    initial_value: '0.0625'
+  # Frame counter incremented once per Clock Display effect tick.
+  # The Clock FPS template sensor below samples and resets it.
+  - id: fps_counter
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
 
 switch:
   - platform: template
@@ -443,44 +602,68 @@ switch:
       - script.execute: apply_auto_brightness
 
 number:
-  # Both sliders store their state in the matching global (see globals:
-  # block). The on_value handler writes through to the global, and on_boot
-  # pushes the restored global back into the entity.
+  # All four sliders store their state in the matching global (see
+  # globals: block). The on_value handler writes through to the global,
+  # and on_boot pushes the restored global back into the entity.
   - platform: template
-    name: "Brightness Bias"
-    id: brightness_bias_number
-    icon: "mdi:tune-vertical"
+    name: "Dim Lux"
+    id: dim_lux_number
+    icon: "mdi:weather-night"
     optimistic: true
     min_value: 0.5
-    max_value: 3.0
-    step: 0.05
+    max_value: 50
+    step: 0.5
     mode: slider
+    # Top of the dark band. At or below this lux the clock sits at one
+    # of B=1/2/3 (1, 2, or 3 LEDs per cap at PWM 1) chosen log-wise.
+    # Raise so dim rooms still get all 3 LEDs lit before the climb;
+    # lower so the climb starts sooner.
     on_value:
       then:
         - globals.set:
-            id: brightness_bias
+            id: dim_lux
             value: !lambda 'return x;'
         - script.execute: apply_auto_brightness
 
   - platform: template
-    name: "Saturation Lux"
-    id: saturation_lux_number
+    name: "Bright Lux"
+    id: bright_lux_number
     icon: "mdi:weather-sunny"
     optimistic: true
     min_value: 50
     max_value: 2000
     step: 10
     mode: slider
-    # Lux limiter: any room brighter than this is treated as if it
-    # were exactly this bright. Below the threshold the curve is
-    # untouched. Use it as a ceiling -- e.g. set to 200 to keep the
-    # clock at "well-lit indoor" brightness even in direct sun.
-    # Curve shape is fixed (REFERENCE_LUX=250 in the lambda); tune
-    # the overall response with Brightness Bias.
+    # Lux at which the lit ramp reaches max brightness. Below this the
+    # clock interpolates linearly in log(lux) from B=3 (at dim_lux) up
+    # to B=255 (at bright_lux). Raise for sunlit rooms with lots of
+    # daytime headroom; lower so cloudy daytime hits full brightness.
     on_value:
       then:
         - globals.set:
-            id: saturation_lux
+            id: bright_lux
+            value: !lambda 'return x;'
+        - script.execute: apply_auto_brightness
+
+  - platform: template
+    name: "Brightness Offset"
+    id: brightness_offset_number
+    icon: "mdi:tune-vertical"
+    optimistic: true
+    min_value: -2.0
+    max_value: 2.0
+    step: 0.1
+    mode: slider
+    unit_of_measurement: "EV"
+    # Pure trim of the lit ramp output, in stops (powers of 2).
+    # +1 doubles the brightness everywhere on the lit ramp; -1 halves
+    # it. The dark band is intentionally INVARIANT to this knob, so a
+    # truly dark room never glows brighter just because you nudged the
+    # daytime trim.
+    on_value:
+      then:
+        - globals.set:
+            id: brightness_offset
             value: !lambda 'return x;'
         - script.execute: apply_auto_brightness
 
@@ -561,6 +744,31 @@ light:
             - light.turn_on:
                 id: clock_leds
                 effect: "Clock Display"
+      # Pin the framework brightness at 100%. We dim entirely in the
+      # display lambda via display_b; routing dimming through the
+      # light's brightness would double-apply the scale via
+      # addressable_light's color correction and crush the B=1/2/3
+      # dark-band floor to PWM 0.
+      - light.turn_on:
+          id: clock_leds
+          brightness: 100%
+          transition_length: 0s
+    # If anything (HA slider, restore from preferences, OTA-time
+    # transient) drops the framework brightness below 100% while the
+    # light is on, snap it back. This keeps color_correction's
+    # local_brightness pinned at 255, so the framebuffer reaches the
+    # WS2812 strip unmolested.
+    on_state:
+      - if:
+          condition:
+            lambda: |-
+              return id(clock_leds).remote_values.is_on() &&
+                     id(clock_leds).remote_values.get_brightness() < 0.999f;
+          then:
+            - light.turn_on:
+                id: clock_leds
+                brightness: 100%
+                transition_length: 0s
     # ESP32-S3 timing: stream via DMA so Wi-Fi / scheduler interrupts can't
     # cause RMT buffer underruns mid-frame. rmt_symbols is the DMA chunk size
     # in bits; 1024 is the largest the new ESP-IDF RMT TX driver accepts here.
@@ -656,6 +864,10 @@ light:
           # headroom that Wi-Fi / API interrupts don't disturb the frame.
           update_interval: 50ms
           lambda: |-
+            // Frame counter for the Clock FPS sensor. The sensor's
+            // template lambda samples and resets this every 5 s.
+            id(fps_counter)++;
+
             static const uint8_t ROW_COL_TO_CAP[5][3] = {
                 {0, 9, 10},
                 {1, 8, 11},
@@ -722,8 +934,13 @@ light:
               float max_c = fmaxf(c.r, fmaxf(c.g, c.b));
               int n;
               float scale;
-              if (max_c < 0.167f) {
-                // Below half a sub-pixel step -- round to fully off.
+              if (max_c < 1.0f / 255.0f) {
+                // Truly-zero colour (e.g. colon at fade=0). Anything
+                // above this gets at least 1 LED at PWM 1 via the
+                // sub-pixel branch below -- that's the dark-room
+                // floor the auto-brightness curve relies on, and we
+                // must not blank caps just because mode/colour math
+                // pulled max_c below half a sub-pixel step.
                 n = 0;
                 scale = 0.0f;
               } else if (max_c >= 1.0f) {
@@ -739,9 +956,14 @@ light:
                 if (n > LEDS_PER_CAP) n = LEDS_PER_CAP;
                 scale = 1.0f / max_c;
               }
-              Color on_c((uint8_t)fminf(255.0f, c.r * scale),
-                         (uint8_t)fminf(255.0f, c.g * scale),
-                         (uint8_t)fminf(255.0f, c.b * scale));
+              // roundf() before the uint8_t cast: in float32, X*scale
+              // for the sub-pixel branch (e.g. X=1/3, scale=1/(1/3))
+              // lands at 0.99999988, which truncates to PWM 0 and
+              // makes the dark-band floor invisible. Round to nearest
+              // so 0.99999988 -> 1 and the floor stays at PWM 1.
+              Color on_c((uint8_t)fminf(255.0f, roundf(c.r * scale)),
+                         (uint8_t)fminf(255.0f, roundf(c.g * scale)),
+                         (uint8_t)fminf(255.0f, roundf(c.b * scale)));
               for (int i = 0; i < LEDS_PER_CAP; i++) {
                 it[base + i] = (i < n) ? on_c : off_c;
               }
@@ -750,12 +972,14 @@ light:
             int mode = id(clock_mode);
             float t_ms = (float)millis();
 
-            // User brightness as a 0..1 float. We translate this to
-            // an integer 0..255 level (B) further down so the
-            // sub-pixel ladder (1..3 LEDs at the dimmest end) maps
-            // cleanly onto HA's 0..255 brightness scale.
-            float user_brightness =
-                id(clock_leds).current_values.get_brightness();
+            // Effective display brightness (0..1). Sourced from the
+            // display_b global, NOT from current_values.get_brightness():
+            // the light is held at 100% framework brightness so
+            // addressable_light's color correction is a no-op, and we
+            // do all dimming ourselves here. See the on_boot /
+            // on_turn_on actions and the apply_auto_brightness script
+            // for how display_b is driven.
+            float user_brightness = id(display_b);
 
             // Hard max-brightness cap. eff_brightness is the user's
             // brightness clamped to max_b; primary and rainbow are

@@ -106,18 +106,22 @@ If you smooth a sensor heavily (median, throttle, sliding window) and use
 the smoothed value to drive a UI element, fast inputs (slider drags,
 toggles) will appear unresponsive — the response is gated by the throttle.
 
-Pattern that keeps both calm history and responsive controls:
+Pattern that keeps both calm history and responsive controls: read fast
+locally, decimate hard for the API. Pair an `on_raw_value` (fires
+*before* filters) feeding a private smoother for the local control loop
+with a separate filter chain (`median` + `throttle`) for the published
+entity:
 
 ```yaml
 sensor:
   - platform: <something>
-    update_interval: 10s
+    update_interval: 1s
     filters:
-      - median: { window_size: 6, send_every: 6, send_first_at: 1 }
+      - median: { window_size: 10, send_every: 30, send_first_at: 1 }
       - throttle: 30s
     on_raw_value:
       then:
-        - lambda: 'id(last_reading) = x;'
+        - lambda: 'id(last_reading) = x;'   # or feed an EMA here
         - script.execute: apply_setting
 
 script:
@@ -260,59 +264,112 @@ that span ~0 lux (bedroom at night) to ~10000 lux (sunlight) without
 flicker, hunting, or unreadable extremes took several iterations. The
 useful lessons:
 
-### Separate the concerns: curve scale, gain, hard cap
+### Map perceptual lux, not linear lux
 
-It is tempting to fold lux response, user gain, and a "max" cap into one
-formula. Don't. Each does a different thing and benefits from being a
-separate, named control:
+A typical room spans ~3 orders of magnitude across a day (1 lux at night,
+~1000 lux peak through a window). Both human perception of brightness and
+the room's own "feel" are roughly logarithmic in lux: 10 → 100 lux feels
+about as different as 100 → 1000. A power curve over **linear** lux gets
+this badly wrong — most of the day collapses into a tiny region of the
+output range while the sub-1-lux zone barely moves.
 
-1. **Curve scale** (`saturation_lux`): the lux value at which the curve
-   reaches maximum brightness. Sets the *horizontal* scale — what the
-   sensor's "loud" looks like to the display. Lower values compress the
-   response into a dim room; higher values stretch it for sunlit rooms.
-2. **Make-up gain** (`bias`): a uniform multiplier on the lit-room bonus.
-   Sets the *vertical* scale without moving the saturation point.
-3. **Hard cap** (`max_brightness`): a ceiling on the final value. Useful
-   for protecting against thermal/PSU limits or muting the display.
+Map `log(lux)` to brightness instead. A two-anchor log-linear ramp
+between `dim_lux` (where the climb starts) and `bright_lux` (where it
+maxes out) gives roughly equal brightness steps for equal log-lux steps,
+which matches how the room reads to a human eye.
 
-We iterated through two designs before settling here. An earlier attempt
-treated `sat_lux` as a hard input clamp (`min(lux, sat_lux)`) and used a
-fixed `REFERENCE_LUX` for the curve shape. That gave clean orthogonality
-("below sat_lux, output is independent of sat_lux") but meant the user
-couldn't actually calibrate where the display saturated — they could only
-veto values above some lux. The current design uses `sat_lux` as the
-curve's own reference so that lowering it actually pulls saturation
-inward, which matches what users mean by "max brightness in *my* room is
-about 200 lux".
+### Three regions, one formula per region
+
+A pure log-linear ramp doesn't work all the way to zero, because the
+sub-pixel ladder (B=1/2/3, see below) collapses to a sliver of lux at
+the bottom. Split the curve into three named regions, each with its own
+job:
+
+1. **Dark band** — `lux ∈ [0, dim_lux]`. Output is one of B=1/2/3,
+   chosen log-wise across `[dim_lux/10, dim_lux]`. Each level gets a
+   meaningful slice of the room's truly-dim time. A truly dark room
+   always lands at B=1.
+2. **Lit ramp** — `lux ∈ [dim_lux, bright_lux]`. Linear in `log(lux)`
+   from B=3 to B=255. Equal log-steps in lux give equal brightness
+   steps.
+3. **Saturated** — `lux ≥ bright_lux`. Output stays at B=255 (then a
+   hard ceiling caps below that if set).
+
+Two anchors (`dim_lux`, `bright_lux`) plus a brightness-offset trim and a
+hard cap are the four user-facing knobs. Each answers a single question
+("at what room lux should the clock just start to brighten?", "at what
+room lux should the clock be at max?", "globally a touch brighter or
+dimmer?", "absolute ceiling?") and they don't fight each other when
+tuned.
 
 ```cpp
 // Pseudocode
-float ratio     = min(lux / sat_lux, 1.0f);          // saturates at sat_lux
-float lit_bonus = powf(ratio, CURVE_P) * (1.0f - FLOOR);
-float target    = FLOOR + lit_bonus * gain;          // make-up gain
-target          = min(target, max_b);                // hard cap
+if (lux <= dim_lux) {
+  // log-quantise into B=1/2/3
+  float t  = (log(lux) - log(dim/10)) / (log(dim) - log(dim/10));
+  int step = clamp((int)(t * 3.0f), 0, 2);
+  target   = (1.0f + step) / 255.0f;
+} else {
+  float t  = (log(lux) - log(dim)) / (log(bright) - log(dim));
+  target   = B3 + clamp(t, 0, 1) * (1.0f - B3);
+  target  *= powf(2.0f, offset_stops);   // trim only the lit ramp
+  target   = max(target, B3);
+}
+target = min(target, max_b);
 ```
 
-The trade-off worth being explicit about: `sat_lux` is *not* orthogonal to
-mid-range brightness. Halving `sat_lux` doubles the brightness at every
-lux below the new saturation point. That's fine if the controls are
-labelled honestly — `sat_lux` is the room-calibration knob, `bias` is the
-"make it dimmer/brighter without recalibrating" knob.
+### Keep the dark band invariant to the daytime trim
 
-### Floor must be bias-invariant
+A "make it brighter overall" knob is genuinely useful, but if it
+multiplies the whole curve it can push a truly dark room above the
+"barely visible" floor — which defeats the point of a dark band. Apply
+the offset to the lit ramp only, and clamp the lit ramp's output to be
+at least B=3. Then the dark-room floor is provable: no setting of the
+trim can lift a pitch-dark room above B=1.
 
-If you let the user gain multiply the whole formula, a low-gain setting
-can mathematically push the dark-room output below the dimmest LED step,
-and a high-gain setting can lift the floor above the dim level you
-designed. Both are surprising. Structure the formula so the floor is an
-*addition*, not a multiplication:
+### Beware addressable_light's hidden brightness multiply
+
+When you implement custom dimming via an `addressable_lambda` effect,
+do **not** also drive the light's `set_brightness()`. ESPHome's
+`AddressableLight::update_state` bakes the light's current brightness
+into the colour-correction pipeline:
 
 ```cpp
-target = FLOOR + (lit_bonus * gain);   // floor is additive, not scaled
+auto max_brightness = to_uint8_scale(val.get_brightness() * val.get_state());
+this->correction_.set_local_brightness(max_brightness);
 ```
 
-Then a pitch-dark room always lands at `FLOOR` regardless of gain, and
-testing this is a one-liner.
+Then every `it[i] = Color(...)` write goes through `set_red/green/blue`
+which call `color_correct_red(red) = scale8_twice(red, max_brightness, local_brightness)`.
+That's a double multiply by brightness: once in your lambda's
+sub-pixel computation, once in the framework. For a sub-pixel target
+of `Color(1, 1, 1)` and a light brightness of `1/255`, the second
+multiply rounds the channels to 0 and your dim end goes invisible
+even though the lambda computed the correct PWM. With `gamma_correct: 1.0`
+this is the entire scaling chain, so the bug is fully exposed.
+
+The fix is to keep the framework's brightness pinned at 100% (so
+`local_brightness=255` and the correction is a no-op) and own the
+dimming entirely in the lambda, sourced from a global. Auto-brightness
+writes the global; the display reads it. The HA brightness slider on
+the light entity is no longer a meaningful UX control in this design;
+either hide it from users or wire it through the same global.
+
+### Smooth the lux feeding the curve, not the published sensor
+
+Two different consumers want two different smoothings:
+
+- The **published lux sensor** in HA wants minimal noise in history,
+  which a median filter + 30 s throttle handles well.
+- The **auto-brightness path** wants to track sustained ambient and
+  ignore transient shadows / a person walking past, which is a smoothness
+  property the median filter does not give. A single-pole exponential
+  filter (`alpha = 1 - exp(-dt/tau)`, `tau ≈ 60 s`) on the raw 10 s
+  samples is the right tool here.
+
+Run them in parallel: feed every raw sample through the EMA into a
+private `last_lux` global used by the brightness curve, and let the
+published sensor keep its own median + throttle for HA history.
 
 ### Sub-pixel dimming for very low brightness
 
@@ -343,15 +400,27 @@ Lux mapping pipelines have many continuous parameters and a few hard
 edges (floor, max cap, limiter threshold). They are perfect targets for a
 small Python script that mirrors the C++ math and asserts properties like:
 
-- Pitch-dark room → brightest sub-pixel state, regardless of gain
-- Curve reaches max brightness exactly at `sat_lux` (with gain = 1.0)
-- Doubling gain → doubles `lit_bonus` at every lux level
+- Pitch-dark room → B=1, regardless of any user trim
+- Dark band yields only B=1/2/3, each over a non-trivial lux slice
+- Lit ramp starts at B=3 at `dim_lux` (continuity), reaches B=255 at
+  `bright_lux`
+- Lit ramp is linear in `log(lux)`: equal log-steps yield equal B-steps
+- Brightness offset multiplies the lit ramp in stops but does not lift
+  the dark band
 - Curve is monotonic across the full lux range
 - Float→`B` rounding edges (`0.0`, `1/255`, `0.5`, `1.0`) land on the
   expected integers
 
 A handful of asserts catches every shape regression we introduced while
 iterating, without needing to flash a board.
+
+It also helps to **replay real device history through the curve**.
+Export a CSV of `(timestamp, entity, lux)` from HA over a few days and
+run a small script that applies both the current and a candidate curve,
+printing a histogram across `B` ranges and the time spent at the floor /
+at max-cap. Decisions like "default `bright_lux` should be 200 vs 300"
+are much clearer when made against a histogram of how your room
+actually behaves.
 
 A standalone script that re-renders the curve to SVG (no plotting library,
 just pure stdlib) makes the docs easy to keep up to date — re-running it
